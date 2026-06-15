@@ -8,7 +8,6 @@ BOOL CaptureExceptionStreamInfo(
     PMINIDUMP_EXCEPTION_INFORMATION exceptionParam,
     MINIDUMP_EXCEPTION_STREAM* stream,
     const CONTEXT** contextRecord) noexcept
-
 {
     EXCEPTION_POINTERS* pointers = nullptr;
     EXCEPTION_RECORD record = {};

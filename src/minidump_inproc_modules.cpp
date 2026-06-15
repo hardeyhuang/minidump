@@ -189,8 +189,6 @@ BOOL WriteModuleCodeViewRecord(HANDLE hFile, PVOID moduleBase, ULONG32* writtenS
 // Writes ModuleListStream descriptors and their trailing strings/CodeView records; stream size excludes trailing storage per minidump rules.
 
 BOOL WriteModuleList(HANDLE hFile, ULONG32 moduleCount, ULONG32 moduleListRva) noexcept
-
-
 {
     INPROC_PEB* peb = GetCurrentPeb();
     INPROC_PEB_LDR_DATA* ldr = nullptr;

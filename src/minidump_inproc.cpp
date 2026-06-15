@@ -4,6 +4,11 @@
 
 namespace minidump_inproc::internal {
 
+#if defined(_MSC_VER)
+// Forward declaration: the per-stream SEH guards below use this as their __except filter.
+LONG WINAPI SwallowMiniDumpFault(DWORD code) noexcept;
+#endif
+
 // Lays out the complete minidump file, computes stream RVAs, writes directories, and serializes each enabled stream.
 BOOL WriteMiniDumpInprocImpl(
     HANDLE hFile,
@@ -34,17 +39,16 @@ BOOL WriteMiniDumpInprocImpl(
     const BOOL writeMemoryInfo = (requestedFlags & MiniDumpWithFullMemoryInfo) != 0;
     const BOOL writeThreadInfo = ((requestedFlags & MiniDumpWithThreadInfo) != 0) ||
                                  ((requestedFlags & MiniDumpWithProcessThreadData) != 0);
-    const BOOL writeUnloadedModules = (requestedFlags & MiniDumpWithUnloadedModules) != 0;
     BOOL includeDataSegs = (requestedFlags & MiniDumpWithDataSegs) != 0;
     const BOOL includeIndirectMemory = (requestedFlags & MiniDumpWithIndirectlyReferencedMemory) != 0;
-    const BOOL ignoreInaccessible = (requestedFlags & MiniDumpIgnoreInaccessibleMemory) != 0;
+    // MiniDumpIgnoreInaccessibleMemory is intentionally not honored: unreadable pages are always
+    // zero-filled so a partially unreadable region never aborts the dump (best-effort output).
 
     const BOOL writeSelectedMemory = !writeFullMemory;
 
     ULONG32 headerRva = 0, directoryRva = sizeof(MINIDUMP_HEADER);
     ULONG32 systemInfoRva = 0, miscInfoRva = 0, moduleListRva = 0, threadListRva = 0;
     ULONG32 threadInfoListRva = 0, memoryInfoListRva = 0, memoryListRva = 0;
-    ULONG32 unloadedModuleListRva = 0;
     ULONG32 exceptionRva = 0, threadContextsRva = 0, contextRva = 0;
     ULONG64 memoryBaseRva = 0;
 
@@ -53,7 +57,7 @@ BOOL WriteMiniDumpInprocImpl(
     ULONG64 memoryListSize64 = 0, selectedMemoryRangeCount = 0;
 
     ULONG32 threadContextsSize = 0, threadInfoListSize = 0, memoryInfoListSize = 0, memoryListSize = 0;
-    ULONG32 unloadedModuleListSize = 0, exceptionStreamSize = 0;
+    ULONG32 exceptionStreamSize = 0;
 
     MINIDUMP_HEADER header = {};
     MINIDUMP_DIRECTORY directories[14] = {};
@@ -65,7 +69,6 @@ BOOL WriteMiniDumpInprocImpl(
     if (hasException) { ++streamCount; exceptionStreamSize = sizeof(MINIDUMP_EXCEPTION_STREAM); }
     if (writeThreadInfo) ++streamCount;
     if (writeMemoryInfo) ++streamCount;
-    if (writeUnloadedModules) { ++streamCount; unloadedModuleListSize = sizeof(MINIDUMP_UNLOADED_MODULE_LIST); }
 
     // Freeze every other thread and snapshot the process exactly once. All later passes read this
     // immutable plan, which is what keeps descriptor counts/sizes consistent with the byte streams.
@@ -74,8 +77,15 @@ BOOL WriteMiniDumpInprocImpl(
     threadCount = g_ThreadPlanCount;
     exceptionThreadIndex = g_ExceptionThreadIndex;
 
-    if (!CountModules(&moduleCount, &moduleNameBytes, &moduleCodeViewBytes)) { SetLastError(ERROR_BAD_LENGTH); return FALSE; }
-    if (writeMemoryInfo && !CountMemoryInfoRanges(&memoryInfoRangeCount)) return FALSE;
+    // Counting touches potentially corrupted process structures (PEB/LDR, VAD). On failure we
+    // degrade the affected stream to empty rather than aborting the whole dump, so the rest of
+    // the streams (threads, contexts, exception, stacks) still get written.
+    if (!CountModules(&moduleCount, &moduleNameBytes, &moduleCodeViewBytes)) {
+        moduleCount = 0; moduleNameBytes = 0; moduleCodeViewBytes = 0;
+    }
+    if (writeMemoryInfo && !CountMemoryInfoRanges(&memoryInfoRangeCount)) {
+        memoryInfoRangeCount = 0; // keep a structurally valid, empty MemoryInfoList stream
+    }
 
     // Sizes of the fixed (non-truncatable) streams. These do not depend on the size budget.
     moduleListStreamSize = sizeof(ULONG32) + moduleCount * sizeof(MINIDUMP_MODULE);
@@ -98,8 +108,7 @@ BOOL WriteMiniDumpInprocImpl(
         threadContextsSize64 +
         (hasException ? exceptionStreamSize : 0) +
         (writeThreadInfo ? threadInfoListSize64 : 0) +
-        (writeMemoryInfo ? memoryInfoListSize64 : 0) +
-        (writeUnloadedModules ? unloadedModuleListSize : 0);
+        (writeMemoryInfo ? memoryInfoListSize64 : 0);
 
     if (writeFullMemory) {
         // Capture every committed region once, then keep as many whole ranges as the budget allows.
@@ -119,38 +128,56 @@ BOOL WriteMiniDumpInprocImpl(
         fullMemoryRangeCount = keptRanges;
         fullMemoryBytes = keptBytes;
     } else {
-        // Thread stacks are mandatory (needed to reconstruct call stacks); always included.
-        if (!CountStackMemoryRanges(threadCount, &stackRangeCount, &stackBytes)) return FALSE;
+        // The MemoryList stream addresses each region's bytes with a 32-bit RVA, so a selected-memory
+        // dump must stay under 4 GB or those RVAs would silently truncate and corrupt the file. We
+        // therefore clamp the effective budget to just under 4 GB (and honor a smaller MaxFileSize if
+        // given), trimming data segments / indirect memory before any RVA can overflow. Full-memory
+        // dumps use the 64-bit Memory64List and are not subject to this limit.
+        constexpr ULONG64 kSelectedDumpRvaLimit = 0xFFFF0000ULL; // < 4 GB, with headroom for padding
+        const ULONG64 effectiveBudget =
+            (maxFileSize != 0 && maxFileSize < kSelectedDumpRvaLimit) ? maxFileSize : kSelectedDumpRvaLimit;
+
+        // Thread stacks are the highest-value selected memory; include them when available. On a
+        // counting failure we degrade to zero stacks instead of aborting the dump.
+        if (!CountStackMemoryRanges(threadCount, &stackRangeCount, &stackBytes)) {
+            stackRangeCount = 0; stackBytes = 0;
+        }
         ULONG64 used = fixedSize + sizeof(ULONG32) +
                        stackRangeCount * sizeof(MINIDUMP_MEMORY_DESCRIPTOR) + stackBytes;
 
-        // Priority 1: writable data segments (all-or-nothing against the remaining budget).
+        // Priority 1: writable data segments (all-or-nothing against the remaining budget; a
+        // counting failure simply drops them).
         if (includeDataSegs) {
-            if (!CountExtraMemoryRanges(includeDataSegs, &extraRangeCount, &extraBytes)) return FALSE;
-            ULONG64 dataSegCost = extraRangeCount * sizeof(MINIDUMP_MEMORY_DESCRIPTOR) + extraBytes;
-            if (hasBudget && used + dataSegCost > budget) {
+            if (!CountExtraMemoryRanges(includeDataSegs, &extraRangeCount, &extraBytes)) {
                 includeDataSegs = FALSE;
                 extraRangeCount = 0;
                 extraBytes = 0;
             } else {
-                used += dataSegCost;
+                ULONG64 dataSegCost = extraRangeCount * sizeof(MINIDUMP_MEMORY_DESCRIPTOR) + extraBytes;
+                if (used + dataSegCost > effectiveBudget) {
+                    includeDataSegs = FALSE;
+                    extraRangeCount = 0;
+                    extraBytes = 0;
+                } else {
+                    used += dataSegCost;
+                }
             }
         }
 
         // Priority 2 (lowest): indirectly-referenced memory, capped by whatever budget is left.
         if (includeIndirectMemory) {
             ULONG32 cap = IndirectMemoryRangesCapacity();
-            if (hasBudget) {
-                const ULONG64 perPage = sizeof(MINIDUMP_MEMORY_DESCRIPTOR) + kIndirectMemoryRangeSize;
-                const ULONG64 remaining = budget > used ? budget - used : 0;
-                const ULONG64 fit = remaining / perPage;
-                if (fit < cap) cap = static_cast<ULONG32>(fit);
-            }
+            const ULONG64 perPage = sizeof(MINIDUMP_MEMORY_DESCRIPTOR) + kIndirectMemoryRangeSize;
+            const ULONG64 remaining = effectiveBudget > used ? effectiveBudget - used : 0;
+            const ULONG64 fit = remaining / perPage;
+            if (fit < cap) cap = static_cast<ULONG32>(fit);
             g_IndirectMemoryRangeCap = cap;
             if (cap != 0) {
                 CollectKnownSelectedMemoryRanges(threadCount, includeDataSegs);
                 if (!CollectIndirectMemoryRanges(threadCount, preferredThreadId, contextProbe,
-                                                 &indirectRangeCount, &indirectBytes)) return FALSE;
+                                                 &indirectRangeCount, &indirectBytes)) {
+                    indirectRangeCount = 0; indirectBytes = 0;
+                }
             }
         }
 
@@ -171,6 +198,13 @@ BOOL WriteMiniDumpInprocImpl(
     memoryInfoListSize = static_cast<ULONG32>(memoryInfoListSize64);
     memoryListSize = static_cast<ULONG32>(memoryListSize64);
 
+    // Compute every stream's file offset (RVA) up front by bumping a running cursor in the exact
+    // order regions are physically laid out on disk. Doing the full layout before writing lets each
+    // stream's directory entry point at a fixed, final offset, and lets us write streams with simple
+    // SetFilePointerEx seeks (so a skipped/faulting stream cannot shift any other stream's position).
+    // Physical order: header -> directory -> SystemInfo -> MiscInfo -> ModuleList(+strings/CV) ->
+    // ThreadList -> [ThreadInfoList] -> [MemoryInfoList] -> Memory(64)List descriptors ->
+    // [Exception] -> thread CONTEXT records -> memory bytes backing store.
     ULONG32 nextRva = directoryRva + streamCount * sizeof(MINIDUMP_DIRECTORY);
     systemInfoRva = nextRva; nextRva += sizeof(MINIDUMP_SYSTEM_INFO);
     miscInfoRva = nextRva; nextRva += sizeof(MINIDUMP_MISC_INFO);
@@ -179,10 +213,14 @@ BOOL WriteMiniDumpInprocImpl(
     if (writeThreadInfo) { threadInfoListRva = nextRva; nextRva += threadInfoListSize; }
     if (writeMemoryInfo) { memoryInfoListRva = nextRva; nextRva += memoryInfoListSize; }
     memoryListRva = nextRva; nextRva += memoryListSize;
-    if (writeUnloadedModules) { unloadedModuleListRva = nextRva; nextRva += unloadedModuleListSize; }
     if (hasException) { exceptionRva = nextRva; nextRva += exceptionStreamSize; }
+    // All thread CONTEXT records sit contiguously; ThreadList entries and the ExceptionStream both
+    // reference into this single block. The exception thread's context is not stored separately --
+    // contextRva simply aliases the exception thread's slot inside the contiguous context array.
     threadContextsRva = nextRva; nextRva += threadContextsSize;
     contextRva = threadContextsRva + exceptionThreadIndex * sizeof(CONTEXT);
+    // The Memory(64)List descriptors carry RVAs that point here; the actual region bytes are the
+    // last thing in the file, streamed after all fixed-size structures are placed.
     memoryBaseRva = nextRva;
 
     header.Signature = MINIDUMP_SIGNATURE;
@@ -198,38 +236,68 @@ BOOL WriteMiniDumpInprocImpl(
     if (writeThreadInfo) { directories[streamIndex].StreamType = ThreadInfoListStream; directories[streamIndex].Location.Rva = threadInfoListRva; directories[streamIndex].Location.DataSize = threadInfoListSize; ++streamIndex; }
     if (writeMemoryInfo) { directories[streamIndex].StreamType = MemoryInfoListStream; directories[streamIndex].Location.Rva = memoryInfoListRva; directories[streamIndex].Location.DataSize = memoryInfoListSize; ++streamIndex; }
     directories[streamIndex].StreamType = writeFullMemory ? Memory64ListStream : MemoryListStream; directories[streamIndex].Location.Rva = memoryListRva; directories[streamIndex].Location.DataSize = memoryListSize; ++streamIndex;
-    if (writeUnloadedModules) { directories[streamIndex].StreamType = UnloadedModuleListStream; directories[streamIndex].Location.Rva = unloadedModuleListRva; directories[streamIndex].Location.DataSize = unloadedModuleListSize; ++streamIndex; }
     if (hasException) { directories[streamIndex].StreamType = ExceptionStream; directories[streamIndex].Location.Rva = exceptionRva; directories[streamIndex].Location.DataSize = exceptionStreamSize; ++streamIndex; }
 
+    // Mandatory file structure: header + stream directory. A failure here means the file is
+    // unusable, so it is the only part that hard-aborts the dump.
     pos.QuadPart = headerRva;
     if (!SetFilePointerEx(hFile, pos, nullptr, FILE_BEGIN) || !SetEndOfFile(hFile)) return FALSE;
     if (!WriteAll(hFile, &header, sizeof(header))) return FALSE;
     if (!WriteAll(hFile, directories, streamCount * sizeof(MINIDUMP_DIRECTORY))) return FALSE;
-    if (!WriteSystemInfo(hFile)) return FALSE;
-    pos.QuadPart = miscInfoRva; if (!SetFilePointerEx(hFile, pos, nullptr, FILE_BEGIN) || !WriteMiscInfo(hFile)) return FALSE;
-    pos.QuadPart = moduleListRva; if (!SetFilePointerEx(hFile, pos, nullptr, FILE_BEGIN) || !WriteModuleList(hFile, moduleCount, moduleListRva)) return FALSE;
-    pos.QuadPart = threadListRva; if (!SetFilePointerEx(hFile, pos, nullptr, FILE_BEGIN) || !WriteThreadList(hFile, threadCount, threadContextsRva, memoryBaseRva, writeSelectedMemory)) return FALSE;
-    if (writeThreadInfo) { pos.QuadPart = threadInfoListRva; if (!SetFilePointerEx(hFile, pos, nullptr, FILE_BEGIN) || !WriteThreadInfoList(hFile, threadCount)) return FALSE; }
-    if (writeMemoryInfo) { pos.QuadPart = memoryInfoListRva; if (!SetFilePointerEx(hFile, pos, nullptr, FILE_BEGIN) || !WriteMemoryInfoList(hFile, memoryInfoRangeCount)) return FALSE; }
-    pos.QuadPart = memoryListRva;
-    if (!SetFilePointerEx(hFile, pos, nullptr, FILE_BEGIN)) return FALSE;
-    if (writeFullMemory) {
-        if (!WriteMemoryDescriptors(hFile, fullMemoryRangeCount, memoryBaseRva)) return FALSE;
-    } else {
-        if (!WriteSelectedMemoryDescriptors(hFile, threadCount, includeDataSegs, stackRangeCount, extraRangeCount, indirectRangeCount, memoryBaseRva)) return FALSE;
 
-    }
-    if (writeUnloadedModules) { pos.QuadPart = unloadedModuleListRva; if (!SetFilePointerEx(hFile, pos, nullptr, FILE_BEGIN) || !WriteEmptyUnloadedModuleList(hFile)) return FALSE; }
-    if (hasException) { pos.QuadPart = exceptionRva; if (!SetFilePointerEx(hFile, pos, nullptr, FILE_BEGIN) || !WriteExceptionStream(hFile, contextRva, exceptionParam)) return FALSE; }
-    pos.QuadPart = threadContextsRva; if (!SetFilePointerEx(hFile, pos, nullptr, FILE_BEGIN) || !WriteThreadContexts(hFile, threadCount, exceptionParam)) return FALSE;
-    pos.QuadPart = static_cast<LONGLONG>(memoryBaseRva);
-    if (!SetFilePointerEx(hFile, pos, nullptr, FILE_BEGIN)) return FALSE;
-    if (writeFullMemory) {
-        if (!WriteMemoryBytes(hFile, fullMemoryRangeCount)) return FALSE;
-    } else {
-        if (!WriteSelectedMemoryBytes(hFile, threadCount, includeDataSegs, indirectRangeCount, ignoreInaccessible)) return FALSE;
+    // Each content stream is emitted under its own SEH guard. If gathering a stream faults because
+    // process memory is severely corrupted, that single stream is skipped (its pre-laid-out region
+    // is left zero-filled) and the dump continues with every other stream intact. Only a genuine
+    // file-I/O failure (bad handle, disk full) still aborts, since nothing further can be written.
+    BOOL ioFailed = FALSE;
+#if defined(_MSC_VER)
+#define INPROC_EMIT_STREAM(seekRva, writeExpr)                                              \
+    do {                                                                                     \
+        __try {                                                                              \
+            pos.QuadPart = static_cast<LONGLONG>(seekRva);                                   \
+            if (!SetFilePointerEx(hFile, pos, nullptr, FILE_BEGIN) || !(writeExpr)) {        \
+                ioFailed = TRUE;                                                             \
+            }                                                                                \
+        } __except (SwallowMiniDumpFault(GetExceptionCode())) {                              \
+            /* memory fault while gathering this stream: skip it, keep the rest of the dump */ \
+        }                                                                                    \
+        if (ioFailed) return FALSE;                                                          \
+    } while (0)
+#else
+#define INPROC_EMIT_STREAM(seekRva, writeExpr)                                              \
+    do {                                                                                     \
+        pos.QuadPart = static_cast<LONGLONG>(seekRva);                                       \
+        if (!SetFilePointerEx(hFile, pos, nullptr, FILE_BEGIN) || !(writeExpr)) {            \
+            return FALSE;                                                                    \
+        }                                                                                    \
+    } while (0)
+#endif
 
+    INPROC_EMIT_STREAM(systemInfoRva, WriteSystemInfo(hFile));
+    INPROC_EMIT_STREAM(miscInfoRva, WriteMiscInfo(hFile));
+    INPROC_EMIT_STREAM(moduleListRva, WriteModuleList(hFile, moduleCount, moduleListRva));
+    INPROC_EMIT_STREAM(threadListRva, WriteThreadList(hFile, threadCount, threadContextsRva, memoryBaseRva, writeSelectedMemory));
+    if (writeThreadInfo) {
+        INPROC_EMIT_STREAM(threadInfoListRva, WriteThreadInfoList(hFile, threadCount));
     }
+    if (writeMemoryInfo) {
+        INPROC_EMIT_STREAM(memoryInfoListRva, WriteMemoryInfoList(hFile, memoryInfoRangeCount));
+    }
+    if (writeFullMemory) {
+        INPROC_EMIT_STREAM(memoryListRva, WriteMemoryDescriptors(hFile, fullMemoryRangeCount, memoryBaseRva));
+    } else {
+        INPROC_EMIT_STREAM(memoryListRva, WriteSelectedMemoryDescriptors(hFile, threadCount, includeDataSegs, stackRangeCount, extraRangeCount, indirectRangeCount, memoryBaseRva));
+    }
+    if (hasException) {
+        INPROC_EMIT_STREAM(exceptionRva, WriteExceptionStream(hFile, contextRva, exceptionParam));
+    }
+    INPROC_EMIT_STREAM(threadContextsRva, WriteThreadContexts(hFile, threadCount, exceptionParam));
+    if (writeFullMemory) {
+        INPROC_EMIT_STREAM(memoryBaseRva, WriteMemoryBytes(hFile, fullMemoryRangeCount));
+    } else {
+        INPROC_EMIT_STREAM(memoryBaseRva, WriteSelectedMemoryBytes(hFile, threadCount, includeDataSegs, indirectRangeCount));
+    }
+#undef INPROC_EMIT_STREAM
 
     return TRUE;
 }

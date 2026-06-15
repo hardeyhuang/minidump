@@ -57,18 +57,6 @@ BOOL WriteMiscInfo(HANDLE hFile) noexcept
 }
 
 
-// Writes a structurally valid empty UnloadedModuleListStream placeholder.
-
-BOOL WriteEmptyUnloadedModuleList(HANDLE hFile) noexcept
-{
-    MINIDUMP_UNLOADED_MODULE_LIST stream = {};
-    stream.SizeOfHeader = sizeof(stream);
-    stream.SizeOfEntry = sizeof(MINIDUMP_UNLOADED_MODULE);
-    stream.NumberOfEntries = 0;
-    return WriteAll(hFile, &stream, sizeof(stream));
-}
-
-
 // Writes ExceptionStream and points it at the already-laid-out exception thread context record.
 
 BOOL WriteExceptionStream(HANDLE hFile, ULONG32 contextRva, PMINIDUMP_EXCEPTION_INFORMATION exceptionParam) noexcept

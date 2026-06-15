@@ -494,8 +494,9 @@ BOOL CountExtraMemoryRanges(BOOL includeDataSegs,
                             ULONG64* rangeCount,
                             ULONG64* bytesCount) noexcept;
 
-// Writes a memory region page-by-page and can zero-fill unreadable chunks when the dump type allows it.
-BOOL WriteRegionBytes(HANDLE hFile, BYTE* base, SIZE_T size, BOOL ignoreInaccessible) noexcept;
+// Writes a memory region page-by-page, always zero-filling unreadable chunks (never fails on
+// inaccessible memory; MiniDumpIgnoreInaccessibleMemory is intentionally not honored).
+BOOL WriteRegionBytes(HANDLE hFile, BYTE* base, SIZE_T size) noexcept;
 
 // Writes MemoryList descriptors for stacks, selected data segments, and indirect pages in the same order as their bytes.
 BOOL WriteSelectedMemoryDescriptors(HANDLE hFile,
@@ -510,8 +511,7 @@ BOOL WriteSelectedMemoryDescriptors(HANDLE hFile,
 BOOL WriteSelectedMemoryBytes(HANDLE hFile,
                               ULONG32 threadCount,
                               BOOL includeDataSegs,
-                              ULONG64 indirectRangeCount,
-                              BOOL ignoreInaccessible) noexcept;
+                              ULONG64 indirectRangeCount) noexcept;
 
 // Writes Memory64List descriptors for MiniDumpWithFullMemory.
 BOOL WriteMemoryDescriptors(HANDLE hFile, ULONG64 rangeCount, ULONG64 memoryBaseRva) noexcept;
@@ -525,8 +525,7 @@ BOOL WriteSystemInfo(HANDLE hFile) noexcept;
 // Writes MiscInfoStream with process id and process timing information.
 BOOL WriteMiscInfo(HANDLE hFile) noexcept;
 
-// Writes a structurally valid empty UnloadedModuleListStream placeholder.
-BOOL WriteEmptyUnloadedModuleList(HANDLE hFile) noexcept;
+
 
 // Writes ExceptionStream and points it at the already-laid-out exception thread context record.
 BOOL WriteExceptionStream(HANDLE hFile, ULONG32 contextRva, PMINIDUMP_EXCEPTION_INFORMATION exceptionParam) noexcept;

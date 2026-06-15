@@ -198,21 +198,23 @@ ULONG64 g_RegionCacheEnd = 0;
 BOOL g_RegionCacheValid = FALSE;
 BOOL g_RegionCacheDumpable = FALSE;
 BOOL g_RegionCacheImage = FALSE;
+BOOL g_RegionCacheWritable = FALSE;
 
 void ResetRegionCache() noexcept
 {
     g_RegionCacheValid = FALSE;
 }
 
-// Returns the committed/dumpable/image classification and bounds of the region containing value.
+// Returns the committed/dumpable/image/writable classification and bounds of the region containing value.
 BOOL ClassifyRegionCached(ULONG64 value, ULONG64* regionStart, ULONG64* regionEnd,
-                          BOOL* dumpable, BOOL* isImage) noexcept
+                          BOOL* dumpable, BOOL* isImage, BOOL* writable) noexcept
 {
     if (g_RegionCacheValid && value >= g_RegionCacheStart && value < g_RegionCacheEnd) {
         *regionStart = g_RegionCacheStart;
         *regionEnd = g_RegionCacheEnd;
         *dumpable = g_RegionCacheDumpable;
         *isImage = g_RegionCacheImage;
+        *writable = g_RegionCacheWritable;
         return TRUE;
     }
 
@@ -224,12 +226,14 @@ BOOL ClassifyRegionCached(ULONG64 value, ULONG64* regionStart, ULONG64* regionEn
     g_RegionCacheEnd = g_RegionCacheStart + static_cast<ULONG64>(mbi.RegionSize);
     g_RegionCacheDumpable = (mbi.State == MEM_COMMIT && IsDumpableProtect(mbi.Protect));
     g_RegionCacheImage = (mbi.Type == MEM_IMAGE);
+    g_RegionCacheWritable = IsWritableProtect(mbi.Protect);
     g_RegionCacheValid = TRUE;
 
     *regionStart = g_RegionCacheStart;
     *regionEnd = g_RegionCacheEnd;
     *dumpable = g_RegionCacheDumpable;
     *isImage = g_RegionCacheImage;
+    *writable = g_RegionCacheWritable;
     return TRUE;
 }
 
@@ -240,16 +244,23 @@ void ResetVisitedHash() noexcept
 
 // Open-addressing visited-page set. Returns TRUE if the page was already present; otherwise inserts
 // it and returns FALSE. A full table is treated as "present" so collection stops growing.
+//
+// Why a hash set at all: multi-layer BFS revisits the same pages constantly; a linear scan of the
+// collected list would make dedup O(n^2). This gives O(1) average dedup using the upper half of the
+// shared scratch buffer (page address 0 is impossible for a valid 4KB page, so 0 marks an empty slot).
 BOOL VisitedPageSeenOrInsert(ULONG64 page) noexcept
 {
     ULONG64* slots = IndirectVisitedHash();
-    const ULONG32 mask = IndirectVisitedHashSlots() - 1; // slot count is a power of two
+    const ULONG32 mask = IndirectVisitedHashSlots() - 1; // slot count is a power of two -> & mask wraps
+    // Fibonacci hashing: page>>12 drops the constant in-page bits, then multiply by 2^64/golden-ratio
+    // to spread the page index across all bits, and take the top bits (>>40) as the bucket. This
+    // scatters sequential/clustered page numbers well, keeping probe chains short.
     ULONG32 h = static_cast<ULONG32>((page >> 12) * 0x9E3779B97F4A7C15ULL >> 40) & mask;
     for (ULONG32 probes = 0; probes <= mask; ++probes) {
         ULONG64 cur = slots[h];
         if (cur == 0) { slots[h] = page; return FALSE; }
         if (cur == page) { return TRUE; }
-        h = (h + 1) & mask;
+        h = (h + 1) & mask; // linear probe to the next slot on collision
     }
     return TRUE;
 }
@@ -270,12 +281,21 @@ BOOL AddIndirectMemoryRangeFromPointer(ULONG64 value, ULONG64 sourceStart, ULONG
     }
 
     ULONG64 regionStart = 0, regionEnd = 0;
-    BOOL dumpable = FALSE, isImage = FALSE;
-    if (!ClassifyRegionCached(value, &regionStart, &regionEnd, &dumpable, &isImage)) {
+    BOOL dumpable = FALSE, isImage = FALSE, writable = FALSE;
+    if (!ClassifyRegionCached(value, &regionStart, &regionEnd, &dumpable, &isImage, &writable)) {
         return TRUE;
     }
-    if (!dumpable || isImage) {
-        return TRUE; // cache makes clustered image/reserved rejects O(1)
+    if (!dumpable) {
+        return TRUE;
+    }
+    // Read-only image pages (code .text / const .rdata) are recoverable from the module files,
+    // so they are never collected as indirect references. Writable image pages, however, are the
+    // module data segments (globals/statics): when MiniDumpWithDataSegs is NOT set they are not
+    // captured wholesale, so we let the reference scan pull in only the pages actually pointed to
+    // (treating large global blocks like heap). When MiniDumpWithDataSegs IS set, those same pages
+    // are already in the known-range plan below and get deduplicated, avoiding double capture.
+    if (isImage && !writable) {
+        return TRUE; // cache makes clustered code/reserved rejects O(1)
     }
 
     ULONG64 page = AlignDown(value, kIndirectMemoryRangeSize);
@@ -432,7 +452,6 @@ BOOL CollectIndirectMemoryRanges(ULONG32 threadCount,
                                  const CONTEXT* preferredContext,
                                  ULONG64* rangeCount,
                                  ULONG64* bytesCount) noexcept
-
 {
     (void)threadCount;
     g_IndirectMemoryRangeCount = 0;
@@ -470,7 +489,6 @@ BOOL CollectIndirectMemoryRanges(ULONG32 threadCount,
 BOOL CountExtraMemoryRanges(BOOL includeDataSegs,
                             ULONG64* rangeCount,
                             ULONG64* bytesCount) noexcept
-
 {
     SYSTEM_INFO sys = {};
     BYTE* address = nullptr;
@@ -508,9 +526,11 @@ BOOL CountExtraMemoryRanges(BOOL includeDataSegs,
 }
 
 
-// Writes a memory region page-by-page and can zero-fill unreadable chunks when the dump type allows it.
+// Writes a memory region page-by-page, always zero-filling unreadable chunks. Unreadable memory
+// never fails the dump: the MiniDumpIgnoreInaccessibleMemory flag is intentionally not honored
+// here, so a partially unreadable region degrades to zeros instead of aborting (best-effort dump).
 
-BOOL WriteRegionBytes(HANDLE hFile, BYTE* base, SIZE_T size, BOOL ignoreInaccessible) noexcept
+BOOL WriteRegionBytes(HANDLE hFile, BYTE* base, SIZE_T size) noexcept
 {
     SYSTEM_INFO sys = {};
     DWORD pageSize = 4096;
@@ -528,12 +548,7 @@ BOOL WriteRegionBytes(HANDLE hFile, BYTE* base, SIZE_T size, BOOL ignoreInaccess
             if (!WriteAll(hFile, cursor, chunk)) {
                 return FALSE;
             }
-        } else if (ignoreInaccessible) {
-            if (!WriteZeros(hFile, chunk)) {
-                return FALSE;
-            }
-        } else {
-            SetLastError(ERROR_PARTIAL_COPY);
+        } else if (!WriteZeros(hFile, chunk)) {
             return FALSE;
         }
         cursor += chunk;
@@ -632,9 +647,7 @@ BOOL WriteSelectedMemoryDescriptors(HANDLE hFile,
 BOOL WriteSelectedMemoryBytes(HANDLE hFile,
                               ULONG32 threadCount,
                               BOOL includeDataSegs,
-                              ULONG64 indirectRangeCount,
-                              BOOL ignoreInaccessible) noexcept
-
+                              ULONG64 indirectRangeCount) noexcept
 {
     // Emit stack bytes in the same plan order as WriteSelectedMemoryDescriptors. Each stack is
     // written at its exact captured size (zero-filling unreadable pages) so descriptor.DataSize
@@ -646,8 +659,7 @@ BOOL WriteSelectedMemoryBytes(HANDLE hFile,
         if (!WriteRegionBytes(
                 hFile,
                 reinterpret_cast<BYTE*>(static_cast<ULONG_PTR>(g_ThreadPlan[i].StackStart)),
-                g_ThreadPlan[i].StackSize,
-                TRUE)) {
+                g_ThreadPlan[i].StackSize)) {
             return FALSE;
         }
     }
@@ -665,7 +677,7 @@ BOOL WriteSelectedMemoryBytes(HANDLE hFile,
             break;
         }
         if (ShouldIncludeExtraMemoryRange(mbi, includeDataSegs)) {
-            if (!WriteRegionBytes(hFile, static_cast<BYTE*>(mbi.BaseAddress), mbi.RegionSize, ignoreInaccessible)) {
+            if (!WriteRegionBytes(hFile, static_cast<BYTE*>(mbi.BaseAddress), mbi.RegionSize)) {
                 return FALSE;
             }
         }
@@ -682,8 +694,7 @@ BOOL WriteSelectedMemoryBytes(HANDLE hFile,
         if (!WriteRegionBytes(
                 hFile,
                 reinterpret_cast<BYTE*>(static_cast<ULONG_PTR>(indirectRanges[i].Start)),
-                indirectRanges[i].Size,
-                TRUE)) {
+                indirectRanges[i].Size)) {
             return FALSE;
         }
     }

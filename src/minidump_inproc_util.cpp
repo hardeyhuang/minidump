@@ -5,7 +5,6 @@ namespace minidump_inproc::internal {
 // Rounds a file RVA or stream size up to the 4-byte alignment required by the minidump format.
 
 ULONG64 Align4(ULONG64 value) noexcept
-
 {
     return (value + 3ULL) & ~3ULL;
 }
