@@ -287,6 +287,47 @@ BOOL BuildThreadPlanAndFreeze(DWORD preferredThreadId) noexcept
         g_ThreadPlan[slot].IsCurrent = TRUE;
     }
 
+    // Guarantee the exception (preferred) thread is always represented. ExceptionStream.ThreadContext
+    // aliases a slot inside the contiguous CONTEXT array via g_ExceptionThreadIndex; if the faulting
+    // thread were missing from the plan, that index would stay 0 and the exception context RVA would
+    // silently point at some OTHER thread's context -- producing an openable but MISLEADING dump.
+    // The snapshot can miss it (snapshot failure, or more threads than kMaxThreads), so if it is not
+    // present we add it explicitly here, opening its handle now (before any suspension) just like the
+    // snapshot threads. preferredThreadId == currentTid is already covered above.
+    if (preferredThreadId != 0 && preferredThreadId != currentTid) {
+        BOOL havePreferred = FALSE;
+        for (ULONG32 i = 0; i < g_ThreadPlanCount; ++i) {
+            if (g_ThreadPlan[i].ThreadId == preferredThreadId) {
+                havePreferred = TRUE;
+                break;
+            }
+        }
+        if (!havePreferred) {
+            ULONG32 slot;
+            if (g_ThreadPlanCount < kMaxThreads) {
+                slot = g_ThreadPlanCount;
+                ++g_ThreadPlanCount;
+            } else {
+                // Plan is full: evict a non-current, non-preferred slot so the exception thread fits.
+                // Prefer the last slot; never evict the writing thread (its context is mandatory too).
+                slot = kMaxThreads - 1;
+                if (g_ThreadPlan[slot].IsCurrent && kMaxThreads >= 2) {
+                    slot = kMaxThreads - 2;
+                }
+                if (g_ThreadPlan[slot].Handle != nullptr) {
+                    CloseHandle(g_ThreadPlan[slot].Handle);
+                }
+            }
+            ZeroMemory(&g_ThreadPlan[slot], sizeof(g_ThreadPlan[slot]));
+            g_ThreadPlan[slot].ThreadId = preferredThreadId;
+            g_ThreadPlan[slot].IsCurrent = FALSE;
+            g_ThreadPlan[slot].Handle = OpenThread(
+                THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION,
+                FALSE,
+                preferredThreadId);
+        }
+    }
+
     // Phase 2: freeze every other thread now that all handles are open.
     for (ULONG32 i = 0; i < g_ThreadPlanCount; ++i) {
         INPROC_THREAD_PLAN_ENTRY& entry = g_ThreadPlan[i];

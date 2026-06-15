@@ -8,7 +8,7 @@ INPROC_API_TABLE g_Apis = {};
 ULONG32 g_IndirectMemoryRangeCount = 0;
 INPROC_MEMORY_RANGE g_KnownMemoryRanges[kMaxKnownMemoryRanges] = {};
 ULONG32 g_KnownMemoryRangeCount = 0;
-alignas(16) BYTE g_ScratchBuffer[kScratchBufferSize] = {};
+__declspec(align(16)) BYTE g_ScratchBuffer[kScratchBufferSize] = {};
 
 volatile LONG g_DumpInProgress = 0;
 

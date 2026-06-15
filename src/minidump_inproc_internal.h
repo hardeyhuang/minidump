@@ -246,7 +246,10 @@ extern INPROC_MEMORY_RANGE g_KnownMemoryRanges[kMaxKnownMemoryRanges];
 extern ULONG32 g_KnownMemoryRangeCount;
 
 // Shared scratch buffer (see kScratchBufferSize). Reinterpreted per phase via the helpers below.
-extern alignas(16) BYTE g_ScratchBuffer[kScratchBufferSize];
+// Use __declspec(align) rather than alignas here: clang/clang-cl reject `extern alignas(N) T arr[]`
+// (it parses alignas as a type attribute in that position), while __declspec(align) is accepted by
+// both MSVC and clang-cl on the declaration.
+extern __declspec(align(16)) BYTE g_ScratchBuffer[kScratchBufferSize];
 
 // Serializes concurrent crashes: only one thread may run the writer at a time.
 extern volatile LONG g_DumpInProgress;
