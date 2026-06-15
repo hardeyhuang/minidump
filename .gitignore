@@ -1,0 +1,25 @@
+# Build directories
+build/
+build-compile-commands/
+.cache/
+
+# CMake / IDE generated
+compile_commands.json
+CMakeCache.txt
+CMakeFiles/
+*.user
+
+# Compiler / linker artifacts
+*.obj
+*.o
+*.lib
+*.exp
+*.ilk
+*.pdb
+*.tlog
+*.idb
+
+# Generated dumps and logs
+*.dmp
+*.log
+_build_log.txt

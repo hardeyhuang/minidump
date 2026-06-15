@@ -1,0 +1,294 @@
+#include "minidump_inproc_internal.h"
+
+namespace minidump_inproc::internal {
+
+// Rounds a file RVA or stream size up to the 4-byte alignment required by the minidump format.
+
+ULONG64 Align4(ULONG64 value) noexcept
+
+{
+    return (value + 3ULL) & ~3ULL;
+}
+
+
+// Rounds an address down to an alignment boundary. The indirect-memory scanner uses this to normalize pointers to page starts.
+
+ULONG64 AlignDown(ULONG64 value, ULONG64 alignment) noexcept
+{
+    return value & ~(alignment - 1ULL);
+}
+
+
+// Reads the current thread segment register to obtain the PEB without calling loader APIs or allocating memory.
+
+INPROC_PEB* GetCurrentPeb() noexcept
+{
+#if defined(_M_X64)
+    return reinterpret_cast<INPROC_PEB*>(__readgsqword(0x60));
+#elif defined(_M_IX86)
+    return reinterpret_cast<INPROC_PEB*>(__readfsdword(0x30));
+#else
+    return nullptr;
+#endif
+}
+
+
+// Reads the TEB pointer directly from the architecture-specific segment register.
+
+PVOID GetCurrentTebPointer() noexcept
+{
+#if defined(_M_X64)
+    return reinterpret_cast<PVOID>(__readgsqword(0x30));
+#elif defined(_M_IX86)
+    return reinterpret_cast<PVOID>(__readfsdword(0x18));
+#else
+    return nullptr;
+#endif
+}
+
+
+// Pre-resolves low-level NTDLL entry points during normal execution so the crash path does not call GetProcAddress lazily.
+
+BOOL ResolveInprocApis() noexcept
+{
+    if (g_ApisInitialized != 0) {
+        return g_Apis.NtQuerySystemInformation != nullptr;
+    }
+
+    HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+    if (ntdll != nullptr) {
+        g_Apis.RtlGetVersion = reinterpret_cast<RtlGetVersionFn>(
+            GetProcAddress(ntdll, "RtlGetVersion"));
+        g_Apis.NtQueryInformationThread = reinterpret_cast<NtQueryInformationThreadFn>(
+            GetProcAddress(ntdll, "NtQueryInformationThread"));
+        g_Apis.NtQuerySystemInformation = reinterpret_cast<NtQuerySystemInformationFn>(
+            GetProcAddress(ntdll, "NtQuerySystemInformation"));
+    }
+
+    InterlockedExchange(&g_ApisInitialized, 1);
+
+    return g_Apis.NtQuerySystemInformation != nullptr;
+}
+
+
+// Converts a FILETIME timestamp to the seconds-since-1970 format used by MINIDUMP_MISC_INFO.
+
+ULONG32 FileTimeToUnixSeconds(const FILETIME& ft) noexcept
+{
+    ULARGE_INTEGER value = {};
+    value.LowPart = ft.dwLowDateTime;
+    value.HighPart = ft.dwHighDateTime;
+    if (value.QuadPart <= kFileTimeUnixEpoch) {
+        return 0;
+    }
+    return static_cast<ULONG32>((value.QuadPart - kFileTimeUnixEpoch) / kFileTimeTicksPerSecond);
+}
+
+
+// Converts a FILETIME duration to seconds for process user/kernel time fields.
+
+ULONG32 FileTimeDurationSeconds(const FILETIME& ft) noexcept
+{
+    ULARGE_INTEGER value = {};
+    value.LowPart = ft.dwLowDateTime;
+    value.HighPart = ft.dwHighDateTime;
+    return static_cast<ULONG32>(value.QuadPart / kFileTimeTicksPerSecond);
+}
+
+
+// Probes the first and last byte of a range under SEH so corrupt pointers do not tear down dump generation.
+
+BOOL SafeReadBytes(const void* address, SIZE_T size) noexcept
+{
+    if (address == nullptr || size == 0) {
+        return FALSE;
+    }
+
+#if defined(_MSC_VER)
+    __try {
+        const volatile BYTE* bytes = static_cast<const volatile BYTE*>(address);
+        (void)bytes[0];
+        (void)bytes[size - 1];
+        return TRUE;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return FALSE;
+    } 
+#else
+    return TRUE;
+#endif
+}
+
+
+// Copies memory under SEH; this is used when reading potentially damaged process structures such as PEB/LDR or exception records.
+
+BOOL SafeCopyBytes(void* dst, const void* src, SIZE_T size) noexcept
+{
+    if (dst == nullptr || src == nullptr) {
+        return FALSE;
+    }
+
+#if defined(_MSC_VER)
+    __try {
+        CopyMemory(dst, src, size);
+        return TRUE;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return FALSE;
+    }
+#else
+    CopyMemory(dst, src, size);
+    return TRUE;
+#endif
+}
+
+
+// Safely validates and clamps an LDR Unicode module path before it is serialized as a MINIDUMP_STRING.
+
+ULONG32 SafeModuleNameLength(const INPROC_UNICODE_STRING* name) noexcept
+{
+    INPROC_UNICODE_STRING local = {};
+    if (!SafeCopyBytes(&local, name, sizeof(local))) {
+        return 0;
+    }
+
+    ULONG32 length = local.Length;
+    if (length > kMaxModuleNameBytes) {
+        length = kMaxModuleNameBytes;
+    }
+    length &= ~1UL;
+
+    if (length != 0 && !SafeReadBytes(local.Buffer, length)) {
+        return 0;
+    }
+    return length;
+}
+
+
+// Computes the on-disk size of a MINIDUMP_STRING including the terminating WCHAR and 4-byte padding.
+
+ULONG32 MinidumpStringSize(ULONG32 bytes) noexcept
+{
+    return static_cast<ULONG32>(Align4(sizeof(ULONG32) + bytes + sizeof(WCHAR)));
+}
+
+
+// Writes a byte range to the caller-provided file handle, splitting very large writes into DWORD-sized WriteFile calls.
+
+BOOL WriteAll(HANDLE hFile, const void* data, ULONG64 size) noexcept
+{
+    const BYTE* bytes = static_cast<const BYTE*>(data);
+    ULONG64 remaining = size;
+
+    while (remaining != 0) {
+        DWORD chunk = remaining > kWriteChunk ? static_cast<DWORD>(kWriteChunk) : static_cast<DWORD>(remaining);
+        DWORD written = 0;
+        if (!WriteFile(hFile, bytes, chunk, &written, nullptr) || written == 0) {
+            return FALSE;
+        }
+        bytes += written;
+        remaining -= written;
+    }
+    return TRUE;
+}
+
+
+// Writes zero-filled padding without heap allocation by reusing a static zero page.
+
+BOOL WriteZeros(HANDLE hFile, ULONG64 size) noexcept
+{
+    static const BYTE zeros[4096] = {};
+    ULONG64 remaining = size;
+
+    while (remaining != 0) {
+        DWORD chunk = remaining > sizeof(zeros) ? static_cast<DWORD>(sizeof(zeros)) : static_cast<DWORD>(remaining);
+        if (!WriteAll(hFile, zeros, chunk)) {
+            return FALSE;
+        }
+        remaining -= chunk;
+    }
+    return TRUE;
+}
+
+
+// Serializes a Windows UNICODE_STRING as a MINIDUMP_STRING while tolerating invalid string buffers.
+
+BOOL WriteMinidumpString(HANDLE hFile, const INPROC_UNICODE_STRING* name) noexcept
+{
+    INPROC_UNICODE_STRING local = {};
+    ULONG32 length = 0;
+    WCHAR nul = 0;
+    ULONG32 total = 0;
+
+    if (SafeCopyBytes(&local, name, sizeof(local))) {
+        length = local.Length;
+        if (length > kMaxModuleNameBytes) {
+            length = kMaxModuleNameBytes;
+        }
+        length &= ~1UL;
+        if (length != 0 && !SafeReadBytes(local.Buffer, length)) {
+            length = 0;
+        }
+    }
+
+    total = MinidumpStringSize(length);
+    if (!WriteAll(hFile, &length, sizeof(length))) {
+        return FALSE;
+    }
+    if (length != 0 && !WriteAll(hFile, local.Buffer, length)) {
+        return FALSE;
+    }
+    if (!WriteAll(hFile, &nul, sizeof(nul))) {
+        return FALSE;
+    }
+    return WriteZeros(hFile, total - sizeof(length) - length - sizeof(nul));
+}
+
+
+// Returns whether a virtual memory protection value is readable enough to safely include in a dump.
+
+BOOL IsDumpableProtect(DWORD protect) noexcept
+{
+    if ((protect & PAGE_GUARD) != 0 || (protect & PAGE_NOACCESS) != 0) {
+        return FALSE;
+    }
+
+    protect &= 0xff;
+    return protect == PAGE_READONLY ||
+           protect == PAGE_READWRITE ||
+           protect == PAGE_WRITECOPY ||
+           protect == PAGE_EXECUTE_READ ||
+           protect == PAGE_EXECUTE_READWRITE ||
+           protect == PAGE_EXECUTE_WRITECOPY;
+}
+
+
+// Returns whether a protection value represents writable image data for MiniDumpWithDataSegs.
+
+BOOL IsWritableProtect(DWORD protect) noexcept
+{
+    if ((protect & PAGE_GUARD) != 0 || (protect & PAGE_NOACCESS) != 0) {
+        return FALSE;
+    }
+    protect &= 0xff;
+    return protect == PAGE_READWRITE ||
+           protect == PAGE_WRITECOPY ||
+           protect == PAGE_EXECUTE_READWRITE ||
+           protect == PAGE_EXECUTE_WRITECOPY;
+}
+
+
+// Decides whether a VirtualQuery region should be included as optional selected memory, currently writable MEM_IMAGE data segments.
+
+BOOL ShouldIncludeExtraMemoryRange(const MEMORY_BASIC_INFORMATION& mbi,
+                                   BOOL includeDataSegs) noexcept
+{
+    if (mbi.State != MEM_COMMIT || !IsDumpableProtect(mbi.Protect)) {
+        return FALSE;
+    }
+    if (includeDataSegs && mbi.Type == MEM_IMAGE && IsWritableProtect(mbi.Protect)) {
+        return TRUE;
+    }
+    return FALSE;
+}
+
+
+} // namespace minidump_inproc::internal
