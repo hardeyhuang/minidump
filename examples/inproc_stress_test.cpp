@@ -39,10 +39,19 @@ constexpr DWORD kDumpWaitMs = 120000;
 // magic in a far, unreferenced page (expected absent) to assert exactly that selectivity.
 constexpr ULONG64 kMagicReferenced   = 0xCAFED00DBEEF1234ULL;
 constexpr ULONG64 kMagicUnreferenced = 0xFEEDFACE0BADF00DULL;
+constexpr ULONG64 kMagicGraphRoot    = 0x1111222233334444ULL;
+constexpr ULONG64 kMagicGraphChild   = 0x5555666677778888ULL;
+constexpr ULONG64 kMagicGraphGrand   = 0x9999AAAABBBBCCCCULL;
 constexpr SIZE_T  kBigGlobalBytes = 8 * 1024 * 1024;
 constexpr SIZE_T  kRefGlobalOffset = 1 * 1024 * 1024; // page a stack pointer will reference
 constexpr SIZE_T  kFarGlobalOffset = 7 * 1024 * 1024; // page nothing references
 volatile unsigned char g_BigGlobal[kBigGlobalBytes];
+
+struct IndirectGraphNode {
+    ULONG64 Magic;
+    IndirectGraphNode* Child;
+    BYTE Padding[4096 - sizeof(ULONG64) - sizeof(void*)];
+};
 
 // ---- child: dedicated dump thread state ----------------------------------------------------
 
@@ -134,6 +143,27 @@ void SpawnWorkers() noexcept
     WaitForSingleObject(g_WorkersReady, 10000);
 }
 
+BOOL StackOverflowScenarioStackBytes(const wchar_t* scenario, SIZE_T* stackBytes) noexcept
+{
+    if (lstrcmpiW(scenario, L"stack_overflow") == 0 || lstrcmpiW(scenario, L"stack_overflow_1m") == 0) {
+        *stackBytes = 1 * 1024 * 1024;
+        return TRUE;
+    }
+    if (lstrcmpiW(scenario, L"stack_overflow_256k") == 0) {
+        *stackBytes = 256 * 1024;
+        return TRUE;
+    }
+    if (lstrcmpiW(scenario, L"stack_overflow_2m") == 0) {
+        *stackBytes = 2 * 1024 * 1024;
+        return TRUE;
+    }
+    if (lstrcmpiW(scenario, L"stack_overflow_4m") == 0) {
+        *stackBytes = 4 * 1024 * 1024;
+        return TRUE;
+    }
+    return FALSE;
+}
+
 // ---- child: crash scenarios ---------------------------------------------------------------
 
 #pragma optimize("", off)
@@ -145,6 +175,14 @@ int RecurseUntilStackOverflow(volatile int depth) noexcept
     return RecurseUntilStackOverflow(depth + 1) + frame[0] + frame[sizeof(frame) - 1];
 }
 #pragma optimize("", on)
+
+DWORD WINAPI StackOverflowThreadProc(LPVOID) noexcept
+{
+    ULONG stackGuarantee = 64 * 1024;
+    (void)SetThreadStackGuarantee(&stackGuarantee);
+    (void)RecurseUntilStackOverflow(0);
+    return 0;
+}
 
 // Writes a magic pattern into one page of the large global block. noinline + a parameter-passed
 // offset/magic keep the address computation off the caller's frame; the leftover pointer/magic in
@@ -166,9 +204,30 @@ __declspec(noinline) void ClobberStackRegion() noexcept
     SecureZeroMemory(const_cast<unsigned char*>(buf), sizeof(buf));
 }
 
+__declspec(noinline) IndirectGraphNode* BuildIndirectObjectGraph() noexcept
+{
+    IndirectGraphNode* root = static_cast<IndirectGraphNode*>(VirtualAlloc(nullptr, 4096, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
+    IndirectGraphNode* child = static_cast<IndirectGraphNode*>(VirtualAlloc(nullptr, 4096, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
+    IndirectGraphNode* grand = static_cast<IndirectGraphNode*>(VirtualAlloc(nullptr, 4096, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
+    if (root != nullptr) {
+        root->Magic = kMagicGraphRoot;
+        root->Child = child;
+    }
+    if (child != nullptr) {
+        child->Magic = kMagicGraphChild;
+        child->Child = grand;
+    }
+    if (grand != nullptr) {
+        grand->Magic = kMagicGraphGrand;
+        grand->Child = nullptr;
+    }
+    return root;
+}
+
 void TriggerCrash(const wchar_t* scenario) noexcept
 {
-    if (lstrcmpiW(scenario, L"av_write") == 0 || lstrcmpiW(scenario, L"av_write_capped") == 0) {
+    if (lstrcmpiW(scenario, L"av_write") == 0 || lstrcmpiW(scenario, L"av_write_capped") == 0 ||
+        wcsncmp(scenario, L"type_", 5) == 0) {
         volatile int* p = nullptr;
         *p = 1;
     } else if (lstrcmpiW(scenario, L"stack_overflow") == 0) {
@@ -194,6 +253,13 @@ void TriggerCrash(const wchar_t* scenario) noexcept
         // Crash; stackAnchor stays live on the stack at dump time.
         volatile int* p = nullptr;
         *p = static_cast<int>(reinterpret_cast<ULONG_PTR>(stackAnchor[0]));
+    } else if (lstrcmpiW(scenario, L"indirect_object_graph") == 0) {
+        IndirectGraphNode* root = BuildIndirectObjectGraph();
+        ClobberStackRegion();
+        volatile void* stackAnchor[8];
+        for (int i = 0; i < 8; ++i) { stackAnchor[i] = root; }
+        volatile int* p = nullptr;
+        *p = static_cast<int>(reinterpret_cast<ULONG_PTR>(stackAnchor[0]));
     } else if (lstrcmpiW(scenario, L"heap_corruption") == 0) {
         HANDLE heap = GetProcessHeap();
         BYTE* p = static_cast<BYTE*>(HeapAlloc(heap, 0, 32));
@@ -213,13 +279,24 @@ int RunChild(const wchar_t* scenario, const wchar_t* dumpPath, ULONG64 maxFileSi
 {
     g_DumpPath = dumpPath;
     g_MaxFileSize = maxFileSize;
-    if (lstrcmpiW(scenario, L"datasegs_indirect") == 0) {
-        // Deliberately omit MiniDumpWithDataSegs and MiniDumpWithFullMemory: the referenced data
-        // segment page must be collected purely by the indirect-reference scan.
+    if (lstrcmpiW(scenario, L"datasegs_indirect") == 0 || lstrcmpiW(scenario, L"indirect_object_graph") == 0 ||
+        lstrcmpiW(scenario, L"type_indirect") == 0) {
+        // Deliberately omit MiniDumpWithDataSegs and MiniDumpWithFullMemory: referenced memory must
+        // be collected purely by the indirect-reference scan.
         g_DumpType = static_cast<MINIDUMP_TYPE>(
             MiniDumpNormal |
             MiniDumpWithIndirectlyReferencedMemory |
             MiniDumpIgnoreInaccessibleMemory);
+    } else if (lstrcmpiW(scenario, L"type_normal") == 0) {
+        g_DumpType = MiniDumpNormal;
+    } else if (lstrcmpiW(scenario, L"type_thread_info") == 0) {
+        g_DumpType = static_cast<MINIDUMP_TYPE>(MiniDumpNormal | MiniDumpWithThreadInfo | MiniDumpWithProcessThreadData);
+    } else if (lstrcmpiW(scenario, L"type_memory_info") == 0) {
+        g_DumpType = static_cast<MINIDUMP_TYPE>(MiniDumpNormal | MiniDumpWithFullMemoryInfo);
+    } else if (lstrcmpiW(scenario, L"type_data_segs") == 0) {
+        g_DumpType = static_cast<MINIDUMP_TYPE>(MiniDumpNormal | MiniDumpWithDataSegs);
+    } else if (lstrcmpiW(scenario, L"type_full_memory") == 0) {
+        g_DumpType = static_cast<MINIDUMP_TYPE>(MiniDumpNormal | MiniDumpWithFullMemory | MiniDumpWithFullMemoryInfo);
     } else {
         g_DumpType = static_cast<MINIDUMP_TYPE>(
             MiniDumpNormal |
@@ -249,6 +326,18 @@ int RunChild(const wchar_t* scenario, const wchar_t* dumpPath, ULONG64 maxFileSi
 
     SetUnhandledExceptionFilter(StressExceptionFilter);
     SpawnWorkers();
+
+    SIZE_T stackBytes = 0;
+    if (StackOverflowScenarioStackBytes(scenario, &stackBytes)) {
+        HANDLE crasher = CreateThread(nullptr, stackBytes, StackOverflowThreadProc, nullptr,
+                                      STACK_SIZE_PARAM_IS_A_RESERVATION, nullptr);
+        if (crasher == nullptr) {
+            return 101;
+        }
+        WaitForSingleObject(crasher, INFINITE);
+        CloseHandle(crasher);
+        return 99;
+    }
 
     TriggerCrash(scenario);
 
@@ -362,12 +451,22 @@ struct Scenario {
 int RunParent(const wchar_t* exePath) noexcept
 {
     const Scenario scenarios[] = {
-        { L"av_write",          0,                  FALSE, FALSE },
-        { L"av_write_capped",   1ull * 1024 * 1024, FALSE, FALSE },
-        { L"use_after_free",    0,                  FALSE, FALSE },
-        { L"stack_overflow",    0,                  FALSE, FALSE },
-        { L"heap_corruption",   0,                  TRUE,  FALSE },
-        { L"datasegs_indirect", 0,                  FALSE, TRUE  },
+        { L"av_write",             0,                    FALSE, FALSE },
+        { L"av_write_capped",      1ull * 1024 * 1024,   FALSE, FALSE },
+        { L"use_after_free",       0,                    FALSE, FALSE },
+        { L"stack_overflow_256k",  12ull * 1024 * 1024,  FALSE, FALSE },
+        { L"stack_overflow_1m",    12ull * 1024 * 1024,  FALSE, FALSE },
+        { L"stack_overflow_2m",    12ull * 1024 * 1024,  FALSE, FALSE },
+        { L"stack_overflow_4m",    12ull * 1024 * 1024,  FALSE, FALSE },
+        { L"heap_corruption",      0,                    TRUE,  FALSE },
+        { L"datasegs_indirect",    0,                    FALSE, TRUE  },
+        { L"indirect_object_graph",0,                    FALSE, FALSE },
+        { L"type_normal",          0,                    FALSE, FALSE },
+        { L"type_thread_info",     0,                    FALSE, FALSE },
+        { L"type_memory_info",     0,                    FALSE, FALSE },
+        { L"type_data_segs",       0,                    FALSE, FALSE },
+        { L"type_indirect",        0,                    FALSE, FALSE },
+        { L"type_full_memory",     128ull * 1024 * 1024, FALSE, FALSE },
     };
 
     unsigned failures = 0;
@@ -412,8 +511,24 @@ int RunParent(const wchar_t* exePath) noexcept
                 verdict = L"FAIL";
                 ++failures;
             }
-            wprintf(L"[%ls] %-18ls dump=%d threads=%lu streams=%lu size=%llu refPage=%d farPage=%d (expect ref=1 far=0)\n",
+            wprintf(L"[%ls] %-22ls dump=%d threads=%lu streams=%lu size=%llu refPage=%d farPage=%d (expect ref=1 far=0)\n",
                     verdict, s.Name, dumpOk, threadCount, streams, size, refPage, farPage);
+            continue;
+        }
+
+        if (lstrcmpiW(s.Name, L"indirect_object_graph") == 0) {
+            BOOL root = dumpOk && FileContainsQword(dumpPath, kMagicGraphRoot);
+            BOOL child = dumpOk && FileContainsQword(dumpPath, kMagicGraphChild);
+            BOOL grand = dumpOk && FileContainsQword(dumpPath, kMagicGraphGrand);
+            const wchar_t* verdict;
+            if (dumpOk && threadsOk && root && child && grand) {
+                verdict = L"PASS";
+            } else {
+                verdict = L"FAIL";
+                ++failures;
+            }
+            wprintf(L"[%ls] %-22ls dump=%d threads=%lu streams=%lu size=%llu root=%d child=%d grand=%d (expect all=1)\n",
+                    verdict, s.Name, dumpOk, threadCount, streams, size, root, child, grand);
             continue;
         }
 
@@ -427,7 +542,7 @@ int RunParent(const wchar_t* exePath) noexcept
             ++failures;
         }
 
-        wprintf(L"[%ls] %-18ls dump=%d threads=%lu streams=%lu size=%llu flags=0x%llx childExit=0x%lx\n",
+        wprintf(L"[%ls] %-22ls dump=%d threads=%lu streams=%lu size=%llu flags=0x%llx childExit=0x%lx\n",
                 verdict, s.Name, dumpOk, threadCount, streams, size, flags, childExit);
     }
 

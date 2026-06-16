@@ -53,14 +53,30 @@ if(MINIDUMP_INPROC_BUILD_SAMPLE)
 
     add_executable(MiniDumpInprocStressTest examples/inproc_stress_test.cpp)
     target_link_libraries(MiniDumpInprocStressTest PRIVATE MiniDumpInproc)
+
+    add_executable(MiniDumpInspect examples/minidump_inspect.cpp)
+    target_link_libraries(MiniDumpInspect PRIVATE Dbghelp)
+
+    add_library(MiniDumpOverflowStackExt SHARED examples/windbg_show_overflow_stack.cpp)
+    target_link_libraries(MiniDumpOverflowStackExt PRIVATE Dbgeng)
+    target_compile_definitions(MiniDumpOverflowStackExt PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+
     if(MSVC)
-        target_compile_options(MiniDumpInprocStressTest PRIVATE /W4 /permissive-)
+        # The stress test is a debugging/validation demo: build it WITHOUT optimization in every
+        # config so WinDbg's `dv` can show stack locals (e.g. when validating indirect_object_graph
+        # in a Release/RelWithDebInfo dump). /Od disables optimization, /Ob0 disables inlining and
+        # /Oy- keeps frame pointers; these override the inherited /O2 /Ob (the D9025 "overriding"
+        # notice is expected and harmless for this demo target only).
+        target_compile_options(MiniDumpInprocStressTest PRIVATE /W4 /permissive- /Od /Ob0 /Oy-)
         set_target_properties(MiniDumpInprocStressTest PROPERTIES LINK_FLAGS "/ENTRY:wmainCRTStartup")
+        target_compile_options(MiniDumpInspect PRIVATE /W4 /permissive-)
+        set_target_properties(MiniDumpInspect PROPERTIES LINK_FLAGS "/ENTRY:wmainCRTStartup")
+        target_compile_options(MiniDumpOverflowStackExt PRIVATE /W4 /permissive-)
     endif()
 endif()
 
 set(DETOURS_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/third_party/Detours" CACHE PATH "Path to Microsoft Detours source tree")
-option(MINIDUMP_INPROC_BUILD_DETOURS_DEMO "Build MiniDumpWriteDump allocation tracing demo with Detours" ON)
+option(MINIDUMP_INPROC_BUILD_DETOURS_DEMO "Build MiniDumpWriteDump allocation tracing demo with Detours" OFF)
 if(MINIDUMP_INPROC_BUILD_DETOURS_DEMO)
     if(NOT EXISTS "${DETOURS_ROOT}/src/detours.h")
         message(FATAL_ERROR "Detours source tree not found: ${DETOURS_ROOT}")
@@ -92,11 +108,17 @@ if(MINIDUMP_INPROC_BUILD_DETOURS_DEMO)
     target_link_libraries(MiniDumpInprocHeapFailTest PRIVATE MiniDumpInproc DetoursLocal Dbghelp)
     target_compile_definitions(MiniDumpInprocHeapFailTest PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE)
 
+    add_executable(GdiUserHandleAllocTrace examples/gdi_user_handle_alloc_trace.cpp)
+    target_link_libraries(GdiUserHandleAllocTrace PRIVATE DetoursLocal user32 gdi32)
+    target_compile_definitions(GdiUserHandleAllocTrace PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE)
+
     if(MSVC)
         target_compile_options(MiniDumpWriteDumpAllocTrace PRIVATE /W4 /permissive-)
         set_target_properties(MiniDumpWriteDumpAllocTrace PROPERTIES LINK_FLAGS "/ENTRY:wmainCRTStartup")
         target_compile_options(MiniDumpInprocHeapFailTest PRIVATE /W4 /permissive-)
         set_target_properties(MiniDumpInprocHeapFailTest PROPERTIES LINK_FLAGS "/ENTRY:wmainCRTStartup")
+        target_compile_options(GdiUserHandleAllocTrace PRIVATE /W4 /permissive-)
+        set_target_properties(GdiUserHandleAllocTrace PROPERTIES LINK_FLAGS "/ENTRY:wmainCRTStartup")
     endif()
 
 endif()

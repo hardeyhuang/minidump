@@ -45,30 +45,69 @@ PVOID GetCurrentTebPointer() noexcept
 #endif
 }
 
+// Caches process-invariant system information and pre-resolves low-level NTDLL entry points during
+// normal execution so the crash path does not call GetNativeSystemInfo/GetProcAddress lazily.
 
-// Pre-resolves low-level NTDLL entry points during normal execution so the crash path does not call GetProcAddress lazily.
-
-BOOL ResolveInprocApis() noexcept
+void ResolveInprocApis() noexcept
 {
-    if (g_ApisInitialized != 0) {
-        return g_Apis.NtQuerySystemInformation != nullptr;
+    // Idempotent: the load-time auto-initializer and any explicit caller(s) may all reach here,
+    // possibly from different threads. Resolving the same routines again would be harmless (the
+    // values are identical), but once a previous call has finished we skip the repeat work. The
+    // flag is published with InterlockedExchange below, so a non-zero read here means a prior call
+    // already populated g_Apis / g_NativeSystemInfo.
+    if (InterlockedCompareExchange(&g_ApisInitialized, 0, 0) != 0) {
+        return;
     }
 
+    GetNativeSystemInfo(&g_NativeSystemInfo);
+    if (g_NativeSystemInfo.dwPageSize == 0) {
+        g_NativeSystemInfo.dwPageSize = 4096;
+    }
     HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
-    if (ntdll != nullptr) {
-        g_Apis.RtlGetVersion = reinterpret_cast<RtlGetVersionFn>(
-            GetProcAddress(ntdll, "RtlGetVersion"));
-        g_Apis.NtQueryInformationThread = reinterpret_cast<NtQueryInformationThreadFn>(
-            GetProcAddress(ntdll, "NtQueryInformationThread"));
-        g_Apis.NtQuerySystemInformation = reinterpret_cast<NtQuerySystemInformationFn>(
-            GetProcAddress(ntdll, "NtQuerySystemInformation"));
+    g_Apis.RtlGetVersion = reinterpret_cast<RtlGetVersionFn>(
+        GetProcAddress(ntdll, "RtlGetVersion"));
+    g_Apis.NtQueryInformationThread = reinterpret_cast<NtQueryInformationThreadFn>(
+        GetProcAddress(ntdll, "NtQueryInformationThread"));
+    g_Apis.NtQuerySystemInformation = reinterpret_cast<NtQuerySystemInformationFn>(
+        GetProcAddress(ntdll, "NtQuerySystemInformation"));
+    g_Apis.NtQueryInformationProcess = reinterpret_cast<NtQueryInformationProcessFn>(
+        GetProcAddress(ntdll, "NtQueryInformationProcess"));
+
+    // GDI/USER object counts come from user32!GetGuiResources. Resolve it ONLY if user32 is already
+    // mapped (GetModuleHandleW, never LoadLibraryW) so this library never forces a user32 dependency
+    // on console/service processes. Non-GUI processes simply leave the pointer null and the comment
+    // stream reports GDI/USER as n/a.
+    HMODULE user32 = GetModuleHandleW(L"user32.dll");
+    if (user32 != nullptr) {
+        g_Apis.GetGuiResources = reinterpret_cast<GetGuiResourcesFn>(
+            GetProcAddress(user32, "GetGuiResources"));
     }
 
     InterlockedExchange(&g_ApisInitialized, 1);
-
-    return g_Apis.NtQuerySystemInformation != nullptr;
 }
 
+DWORD NativePageSize() noexcept
+{
+    return g_NativeSystemInfo.dwPageSize != 0 ? g_NativeSystemInfo.dwPageSize : 4096;
+}
+
+BYTE* MinimumApplicationAddress() noexcept
+{
+    return static_cast<BYTE*>(g_NativeSystemInfo.lpMinimumApplicationAddress);
+}
+
+BYTE* MaximumApplicationAddress() noexcept
+{
+    return static_cast<BYTE*>(g_NativeSystemInfo.lpMaximumApplicationAddress);
+}
+
+
+// Normalizes caller input into a production hard cap. Values below 4 MB are clamped to 4 MB.
+
+ULONG64 NormalizeHardMaxFileSize(ULONG64 maxFileSize) noexcept
+{
+    return maxFileSize >= kMinHardMaxFileSize ? maxFileSize : kMinHardMaxFileSize;
+}
 
 // Converts a FILETIME timestamp to the seconds-since-1970 format used by MINIDUMP_MISC_INFO.
 
@@ -95,7 +134,7 @@ ULONG32 FileTimeDurationSeconds(const FILETIME& ft) noexcept
 }
 
 
-// Probes the first and last byte of a range under SEH so corrupt pointers do not tear down dump generation.
+// Probes every page touched by a range under SEH so corrupt middle pages do not tear down dump generation.
 
 BOOL SafeReadBytes(const void* address, SIZE_T size) noexcept
 {
@@ -105,17 +144,30 @@ BOOL SafeReadBytes(const void* address, SIZE_T size) noexcept
 
 #if defined(_MSC_VER)
     __try {
+        ULONG_PTR pageSize = NativePageSize();
+        ULONG_PTR start = reinterpret_cast<ULONG_PTR>(address);
+        ULONG_PTR end = start + size;
+        if (end <= start) {
+            return FALSE;
+        }
+
         const volatile BYTE* bytes = static_cast<const volatile BYTE*>(address);
         (void)bytes[0];
-        (void)bytes[size - 1];
+        ULONG_PTR cursor = (start & ~(pageSize - 1ULL)) + pageSize;
+        while (cursor < end) {
+            (void)*reinterpret_cast<const volatile BYTE*>(cursor);
+            cursor += pageSize;
+        }
+        (void)*reinterpret_cast<const volatile BYTE*>(end - 1);
         return TRUE;
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         return FALSE;
-    } 
+    }
 #else
     return TRUE;
 #endif
 }
+
 
 
 // Copies memory under SEH; this is used when reading potentially damaged process structures such as PEB/LDR or exception records.
@@ -232,7 +284,7 @@ BOOL WriteMinidumpString(HANDLE hFile, const INPROC_UNICODE_STRING* name) noexce
     if (!WriteAll(hFile, &length, sizeof(length))) {
         return FALSE;
     }
-    if (length != 0 && !WriteAll(hFile, local.Buffer, length)) {
+    if (length != 0 && !WriteRegionBytes(hFile, reinterpret_cast<BYTE*>(local.Buffer), length)) {
         return FALSE;
     }
     if (!WriteAll(hFile, &nul, sizeof(nul))) {

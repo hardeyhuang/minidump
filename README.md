@@ -11,7 +11,7 @@ BOOL WriteMiniDumpInproc(
     HANDLE hFile,
     MINIDUMP_TYPE DumpType,
     PMINIDUMP_EXCEPTION_INFORMATION ExceptionParam,
-    ULONG64 MaxFileSize);   // 0 = 不限制
+    ULONG64 MaxFileSize);   // 硬上限；小于 4 MB（含 0）钳制到 4 MB
 ```
 
 
@@ -28,7 +28,7 @@ BOOL WriteMiniDumpInproc(
 | **崩溃路径安全性** | 专为崩溃现场设计：SEH 包裹、坏页补零、不走 loader 锁、不调用易挂起 API | 崩溃现场调用需要的堆/loader/加载 DLL 操作均可能在堆或加载器已损坏时失败 |
 | **线程一致性** | 进入后**冻结其余线程 + 单次快照固化计划**，描述符与字节流一致（细节与例外见正文） | 由系统保证，进程内自我 dump 时同样面临活动进程一致性问题 |
 | **并发崩溃** | `InterlockedCompareExchange` 单入口串行化，多线程同时崩溃只写一次 | 无内建串行化，需调用方自行加锁 |
-| **大小控制** | 原生支持 `MaxFileSize` 软上限 + **优先级裁剪**（栈/context 强制，DataSegs、间接内存按预算逐层截断） | 无大小上限参数；体积由 `DumpType` 决定，要么全要么无 |
+| **大小控制** | 原生支持 `MaxFileSize` 硬上限 + **优先级裁剪**（崩溃栈/主线程栈优先，其它栈和可选内存按预算裁剪） | 无大小上限参数；体积由 `DumpType` 决定，要么全要么无 |
 | **间接引用内存** | **多层 BFS 指针扫描**（崩溃线程子树优先，去重哈希 + VirtualQuery 缓存） | `MiniDumpWithIndirectlyReferencedMemory` 为单层引用，且依赖堆分配 |
 | **功能完整度** | 裁剪实现：`HandleData` / `TokenInformation` 等**有意不写**（见下），`UnloadedModules` 仅占位 | **功能完整**：句柄、Token、卸载模块、回调扩展等全面支持 |
 | **可扩展回调** | 无 `MINIDUMP_CALLBACK`（崩溃路径刻意保持简单） | 支持 `CallbackParam` 回调，可精细控制每个 stream/内存块 |
@@ -48,12 +48,28 @@ BOOL WriteMiniDumpInproc(
 
 ### 支持的 `MINIDUMP_TYPE` 标志与支持程度
 
-固定写入（与标志无关，始终产出）：`SystemInfoStream`、`MiscInfoStream`、`ModuleListStream`、`ThreadListStream` + 全部线程 `CONTEXT`；传入异常信息时附带 `ExceptionStream`。
+固定写入（与标志无关，始终产出）：`SystemInfoStream`、`MiscInfoStream`、`CommentStreamA`、`ModuleListStream`、`ThreadListStream` + 全部线程 `CONTEXT`；传入异常信息时附带 `ExceptionStream`。
+
+> **`CommentStreamA`（系统/进程内存与资源摘要）**：始终写入一段 ANSI 文本（三行），记录崩溃时的关键内存与资源指标，方便后续定位 OOM / 内存泄漏 / 句柄泄漏 / GDI-USER 泄漏 / 内核池泄漏。**WinDbg 打开 dump 时会自动显示该 Comment**，无需额外命令；`MiniDumpInspect` 也会打印其文本。取值全程**零堆分配**、SEH 保护，查询失败则记为 `unavailable` / `n/a` 而不影响 dump。示例：
+>
+> ```text
+> SysMem: Load=46% PhysTotal=130514MB PhysAvail=70302MB CommitTotal=149659MB CommitAvail=70099MB VirtTotal=134217727MB VirtAvail=134213403MB
+> ProcMem: WorkingSet=8MB PeakWorkingSet=8MB PrivateCommit=30MB PeakCommit=30MB VirtSize=4324MB PeakVirtSize=4324MB PageFaults=2262
+> ProcRes: PagedPool=62KB PeakPagedPool=62KB NonPagedPool=84KB PeakNonPagedPool=84KB Handles=51 PeakHandles=51 GDI=50 USER=40
+> ```
+>
+> 各行来源与含义：
+>
+> - **`SysMem`** ← `GlobalMemoryStatusEx`（kernel32 静态导入）：`Load`=系统内存负载%、`Phys*`=物理内存总量/可用、`Commit*`=提交（页面文件）总量/可用、`Virt*`=本进程虚拟地址空间总量/可用。
+> - **`ProcMem`** ← 预解析 `NtQueryInformationProcess(ProcessVmCounters → VM_COUNTERS_EX)`：`WorkingSet`/`PeakWorkingSet`、`PrivateCommit`（私有提交 = Private Bytes）/`PeakCommit`（峰值提交）、`VirtSize`/`PeakVirtSize`（虚拟大小及峰值）、`PageFaults`（缺页次数）。
+> - **`ProcRes`** ← 内核池配额（同上 `VM_COUNTERS_EX`）+ 句柄数 + GDI/USER 对象数：`PagedPool`/`NonPagedPool`（及各自峰值，KB 粒度）反映内核对象占用的两类内核池；`Handles`/`PeakHandles` ← `NtQueryInformationProcess(ProcessHandleCount)`，峰值用于句柄泄漏定位；`GDI`/`USER` ← `user32!GetGuiResources`。
+>
+> 关于 `GDI`/`USER`：仅当进程**已加载 user32** 时采集——库在加载期用 `GetModuleHandleW`（**绝不** `LoadLibrary`）条件解析 `GetGuiResources` 指针，因此**不会给控制台/服务进程强加 user32 依赖**；非 GUI 进程显示 `GDI=n/a USER=n/a`。该调用跨入 win32k 子系统、有 SEH 保护，且在冻结其它线程**之前**采集以规避 GUI 锁死锁。`GetGuiResources` 自身**不做用户态堆分配**（由 `GdiUserHandleAllocTrace` demo 实测验证，见下"构建"），符合崩溃路径无堆分配的约束。
 
 | 标志 | 支持程度 | 说明 |
 |---|---|---|
-| `MiniDumpNormal` | ✅ 完整 | 基础流 + 全部线程栈（`MemoryList`），可还原各线程调用栈 |
-| `MiniDumpWithFullMemory` | ✅ 完整 | 改写 `Memory64List`，dump 全部已提交可读区域；**忽略 `MaxFileSize`**（见下，避免按地址顺序截断时误丢高地址的线程栈） |
+| `MiniDumpNormal` | ✅ 裁剪完整 | 基础流 + 按硬上限优先级保留的线程栈窗口（`MemoryList`），优先保证崩溃线程与主线程 |
+| `MiniDumpWithFullMemory` | ✅ 完整或失败 | 改写 `Memory64List`，dump 全部已提交可读区域；若完整 full-memory dump 超过 `MaxFileSize` 硬上限则失败，不静默截断 |
 | `MiniDumpWithFullMemoryInfo` | ✅ 完整 | 写 `MemoryInfoList`（VirtualQuery 区域属性） |
 | `MiniDumpWithThreadInfo` | ✅ 完整 | 写 `ThreadInfoList`（创建/内核/用户时间、起始地址等） |
 | `MiniDumpWithProcessThreadData` | ✅ 同上 | 等价触发 `ThreadInfoList` |
@@ -68,11 +84,44 @@ BOOL WriteMiniDumpInproc(
 
 > 约定：表中"忽略/不写"的标志传入后**不会导致失败**，只是不产生对应内容；`header.Flags` 仍如实记录调用方请求的原始标志位，便于分析端识别意图。
 
-- **`MaxFileSize` 与优先级裁剪（仅作用于选择性内存 dump）**：`MaxFileSize=0` 表示不限制；非 0 时作为软上限，按优先级填充直至逼近上限。强制层（始终写入，即使超限——否则 dump 无意义）：Header、SystemInfo、MiscInfo、ModuleList、ThreadList + 全部线程 context、ExceptionStream、以及**所有线程栈**。可裁剪层按优先级从高到低：(1) `MiniDumpWithDataSegs` 可写数据段（预算不足则整体放弃），(2) `MiniDumpWithIndirectlyReferencedMemory` 间接引用内存（最低优先级，按剩余预算逐页截断）。
-  - `MaxFileSize` 类型为 `ULONG64`，取值上不设人为上限，预算算术全程 64 位、不会溢出；填得过大只是"不裁剪"。
-  - **软上限语义**：若 `MaxFileSize` 比强制层还小，强制层仍会写出，最终文件可能略超 `MaxFileSize`（保证 dump 有用）。
-  - **`MiniDumpWithFullMemory` 忽略 `MaxFileSize`**：full memory dump 用 64 位 `Memory64List`，目标就是捕获**完整**的已提交可读区域。若对它套用字节预算，会按 `VirtualQuery` 的地址顺序（低→高）截断；而线程栈通常在高地址，小的 `MaxFileSize` 可能保留一堆低地址区域、却**把线程栈丢掉**，破坏调用栈还原——这恰恰是 full memory 使用者最不想要的。因此设置 `MiniDumpWithFullMemory` 时，**无论 `MaxFileSize` 取值多少都保留全部捕获区域**。需要受控体积请改用选择性内存 dump（栈强制保留，仅 DataSegs/间接内存按预算裁剪）。
-  - **格式硬上限（4 GB）**：选择性内存 dump（非 `MiniDumpWithFullMemory`）的 `MemoryList` 用 32 位 RVA 寻址。内部把可裁剪层的有效预算上限设为略小于 4 GB，优先裁掉 DataSegs/间接内存。但**强制线程栈不受该预算约束**，极端情况下（如海量大栈线程）其字节总量仍可能把内存字节区推过 4 GB；此时不会产出 RVA 静默截断的损坏 dump，而是在布局阶段以 64 位精度复核内存字节区尾端，**超出即直接失败返回 `ERROR_FILE_TOO_LARGE`**。需要超过 4 GB 请用 `MiniDumpWithFullMemory`（64 位 `Memory64List`，仅受磁盘与进程已提交内存约束）。
+- **`MaxFileSize` 与优先级裁剪**：`MaxFileSize` 是硬上限（字节）；调用前先经 `NormalizeHardMaxFileSize` 归一化——小于 4 MB（含 0）一律按 **4 MB** 处理（当前实现**没有"0 = 不限制"语义**）。数据写入分两层：**固定层**必须能放入硬上限，否则直接失败；**可裁剪层**在剩余预算内按优先级填充，预算不够就裁剪/丢弃。
+
+  **第一层 · 固定层（必写，放不下即 `ERROR_FILE_TOO_LARGE`）**：与 `DumpType` / 预算无关，是 dump 可打开、可分析的最小骨架。
+
+  | 优先级 | 内容 | 说明 |
+  |---|---|---|
+  | 1 | Header + Stream Directory | 文件头与目录，最小结构 |
+  | 2 | `SystemInfoStream` | CPU 架构、OS 版本 |
+  | 3 | `MiscInfoStream` | 进程 ID 等 |
+  | 4 | `ModuleListStream`（+ CodeView） | 还原符号必需 |
+  | 5 | `ThreadListStream` + 全部线程 `CONTEXT` | 线程列表与寄存器上下文 |
+  | 6 | `ExceptionStream` | 传入异常信息时写，指向异常线程 context |
+  | 7 | `ThreadInfoList` / `MemoryInfoList` | 按 `DumpType` 标志触发 |
+
+  **第二层 · 栈与可选内存（在剩余预算内按下表顺序填充，不足则裁剪/放弃）**：
+
+  | 优先级 | 内容 | 裁剪行为 |
+  |---|---|---|
+  | 1 | **崩溃/异常线程栈窗口** | 最高优先；`STATUS_STACK_OVERFLOW` 且原始栈 ≤ 1 MB 时**完整保留**（放不下直接失败），> 1 MB 时只保留 live 窗口 |
+  | 2 | **栈溢出高地址栈顶辅助窗口** | 仅 `STATUS_STACK_OVERFLOW` 且 > 1 MB：保留靠近 `StackBase` 的窗口，用于看递归进入前的调用来源 |
+  | 3 | **主线程栈窗口** | 次高优先，保证主线程可回溯 |
+  | 4 | **其它线程栈窗口** | best-effort，默认每个裁到约 1 MB，预算不足按顺序丢弃 |
+  | 5 | `MiniDumpWithDataSegs` 可写数据段 | 预算不足时**整体放弃** |
+  | 6 | `MiniDumpWithIndirectlyReferencedMemory` 间接引用内存 | **最低优先级**，按剩余预算逐页截断（其内部又以"崩溃线程引用子树优先于其它线程子树"细分，见下"多层间接引用扫描"） |
+
+  一句话优先级链：
+
+  ```text
+  Header/Directory/SystemInfo/MiscInfo/ModuleList/ThreadList+Context/Exception（固定，放不下即失败）
+    → 崩溃线程栈 → 栈溢出高地址栈顶窗口 → 主线程栈 → 其它线程栈
+    → DataSegs → 间接引用内存（崩溃线程子树 → 其它线程子树）
+  ```
+
+  - **崩溃线程 == 主线程时不重复记录**：主线程栈仅在 `mainIndex != exceptionIndex` 时才单独纳入；崩溃就在主线程时该步直接跳过。即便未跳过，`IncludePrimaryStack` 对已标记 `IncludeStack` 的线程也会直接返回，因此 `MemoryList` 不会出现两条相同栈范围。其它线程循环也会跳过 `exceptionIndex` / `mainIndex`。
+  - **栈裁剪**：线程栈不再整段强制写入；默认每个线程栈窗口限制在约 1 MB 内（`kMaxCapturedStackBytes`）。`STATUS_STACK_OVERFLOW` 会先看异常线程原始栈空间（`kStackOverflowFullStackThreshold` = 1 MB）：若不超过 1 MB，则完整记录该栈（硬上限放不下则失败返回 `ERROR_FILE_TOO_LARGE`）；若超过 1 MB，则用确定性双窗口——从异常 `SP/RSP` 起保留约 512 KB 的 live unwind 窗口（`kStackOverflowLiveStackBytes`），并额外保留靠近 `StackBase` 的高地址栈顶约 512 KB（`kStackOverflowHighStackBytes`），用来观察递归进入前的调用来源；中间重复递归帧丢弃，避免 12 MB 这类大栈直接撑爆 dump。
+  - **`MiniDumpWithFullMemory` 硬上限**：full memory dump 不走上面的栈裁剪/优先级，保持"完整或失败"语义、不按地址顺序截断。若完整的已提交可读区域、描述符和固定层总量超过 `MaxFileSize` 硬上限，返回 `ERROR_FILE_TOO_LARGE`。
+  - **如何让 FullMemory"不限制大小"**：当前实现下 FullMemory 仍受硬上限约束，且 `MaxFileSize = 0` 会被钳到 4 MB（不是"不限制"）。若希望事实上不限制，**直接传一个远大于进程已提交内存的超大值**即可，例如 `1ULL * 1024 * 1024 * 1024 * 1024`（1 TB）；FullMemory 用 64 位 `Memory64List`，预算算术全程 64 位、不受选择性 dump 的 4 GB RVA 限制，传超大值是安全的。
+  - **格式硬上限（4 GB）**：选择性内存 dump（非 `MiniDumpWithFullMemory`）的 `MemoryList` 用 32 位 RVA 寻址。内部把有效预算上限设为略小于 4 GB（`kSelectedDumpRvaLimit`）；若最终布局仍会超过 32 位 RVA 或 `MaxFileSize` 硬上限，直接失败返回 `ERROR_FILE_TOO_LARGE`，不产出 RVA 静默截断的损坏 dump。
 
 - **多层间接引用扫描**：间接内存采用按层 BFS。第 1 层 = 线程栈上指针指向的 4K 可读页；第 2/3 层 = 从已收集页里再扫出的指针所指向的页（深度上限 `kIndirectMaxScanLayers`，默认 3，相关性随层数衰减）。优先级：**崩溃/异常线程的整棵引用子树（第 1→2→3 层）** 先于其它线程的子树收集，从而在预算紧张时优先保留与崩溃最相关的数据。去重用 scratch 缓冲上半区的开放寻址哈希集（O(1)，避免多层后退化为 O(n²)），并对 `VirtualQuery` 做单条区域缓存以降低聚簇指针的查询开销。收集总量受 `MaxFileSize` 预算与缓冲容量共同约束。
 
@@ -85,14 +134,15 @@ BOOL WriteMiniDumpInproc(
   - **栈/线程 context 一致**：线程 context 直接来自已冻结的线程，与采集到的栈字节在同一冻结现场，回栈一致。例外：若使用专用 dump 线程范式（崩溃线程投递 `EXCEPTION_POINTERS` 给 dump 线程），异常线程的 context 来自崩溃发生时刻、其栈字节来自之后的冻结时刻，二者不是严格同一瞬间（实践中崩溃线程在投递后等待、不再前进，通常仍一致）。
   - **`MiniDumpWithDataSegs` 一致性较弱**：选择性 dump 里的可写数据段在计数 / 写描述符 / 写字节三个阶段分别重走 `VirtualQuery`（未像 full memory 那样固化成固定列表）。其余线程已冻结时地址空间通常稳定，但严格来说这部分不享有“描述符与字节流绝对一致”的保证（后续可优化为固化计划）。
 - **并发崩溃串行化**：通过 `InterlockedCompareExchange` 单入口保护，多个线程同时崩溃时只有第一个写 dump，其余返回 `FALSE`（`ERROR_BUSY`），避免共享静态缓冲区被竞争。
-- **初始化（强依赖加载期预解析，崩溃路径绝不走 loader）**：库在模块加载时（静态初始化阶段，`AutoInitInprocApis` 全局构造）自动预解析 `ntdll` 导出（`RtlGetVersion` / `NtQueryInformationThread` / `NtQuerySystemInformation`）。崩溃路径**绝不** lazy 调用 `GetModuleHandleW` / `GetProcAddress`（这些会取 loader 锁，崩溃现场可能已被持有或损坏）。若由于异常的初始化顺序导致加载期预解析未完成，`WriteMiniDumpInproc` 会直接失败返回 `FALSE`（`ERROR_NOT_READY`），而不是在崩溃路径触碰 loader。本库不提供、也不需要显式 `InitMiniDumpInproc()`。
+- **初始化（强依赖加载期预解析，崩溃路径绝不走 loader）**：库在模块加载时（静态初始化阶段，`AutoInitInprocApis` 全局构造）自动预解析 `ntdll` 导出（`RtlGetVersion` / `NtQueryInformationThread` / `NtQuerySystemInformation` / `NtQueryInformationProcess`）。崩溃路径**绝不** lazy 调用 `GetModuleHandleW` / `GetProcAddress`（这些会取 loader 锁，崩溃现场可能已被持有或损坏）。若由于异常的初始化顺序导致加载期预解析未完成，`WriteMiniDumpInproc` 会直接失败返回 `FALSE`（`ERROR_NOT_READY`），而不是在崩溃路径触碰 loader。
+  - **可选的显式预解析 `ResolveInprocApis()`**：除自动加载期初始化外，库还**导出**一个幂等的 `ResolveInprocApis()`（声明在 `minidump_inproc.h`）。调用它**非必需**——它只是让上述预解析在一个**确定的时机**发生：跨 translation unit / DLL 的全局构造顺序是未定义的，若你自己的全局/静态初始化依赖本库已就绪，可在其中**主动先调用** `ResolveInprocApis()` 以消除该顺序依赖。该函数内部用 `g_ApisInitialized` 标志判重，实际解析只执行一次，可重复、多线程安全调用，且只走 `GetModuleHandle` / `GetProcAddress`、**绝不** `LoadLibrary`。
 - **内存复用**：进程信息快照缓冲、全内存范围表、间接引用范围表/哈希集**复用同一块 scratch 缓冲**（这些用途在时间上互不重叠），整体静态占用显著下降。
 
 
 - 文件由调用方打开并传入 `hFile`，函数内不构造路径、不创建文件、不分配大缓冲区。
 - MSVC 构建下用 SEH 包住关键内存读取和写 dump 主流程，坏页会尽量以零页补齐。
 - **逐 stream 容错（内存严重破坏时不彻底失败）**：除"文件头 + stream 目录"这一最小结构外，每个 stream 的采集与写入都在**独立的 SEH 保护**下进行。如果在内存严重破坏的情况下某个 stream 采集时触发**访问违例（SEH fault）**，该 stream 会被**跳过**（其预排布的区域保持零填充），dump 继续写出其余所有 stream，而不是整体失败。计数阶段（模块/内存信息/栈/数据段/间接引用）的失败同样降级为"该部分为空"而非中止。
-  - **当前精确语义**：被吞掉、可跳过的只有 **SEH 访问违例**；而 stream 写函数**显式返回 `FALSE`**（无论是文件 I/O 失败，还是个别采集函数如 `CaptureExceptionStreamInfo` 返回 `FALSE`）目前都会中止整个 dump。也就是说，"采集失败"与"I/O 失败"两类 `FALSE` 尚未在返回码层面区分。绝大多数情况下显式 `FALSE` 确实来自文件 I/O（句柄无效、磁盘写满），中止是合理的；后续可把"采集失败跳过 / I/O 失败中止"做成分层返回码以进一步细化。这样即使在受损进程里，也能尽量产出一个"残缺但可打开、信息尽可能多"的 dump。
+  - **当前精确语义**：SEH 访问违例会按 stream 跳过；支持三态返回的 stream 可显式返回 `Skip` 而不中止；普通 stream 写函数返回 `FALSE` 仍按文件 I/O 或不可恢复写入失败处理并中止。这样即使在受损进程里，也能尽量产出一个"残缺但可打开、信息尽可能多"的 dump，同时避免在文件句柄无效、磁盘写满等场景继续写坏文件。
 
 ### 已知残留风险与限制
 
@@ -110,11 +160,12 @@ BOOL WriteMiniDumpInproc(
 | 静态缓冲 | 大小 | 用途 |
 |---|---|---|
 | `g_ScratchBuffer` | **4 MB** | 多用途共享 scratch（见下复用说明） |
-| `g_ThreadPlan[kMaxThreads]` | 1024 × 88 B ≈ **88 KB** | 冻结后固化的不可变"线程计划"（最多 1024 线程） |
+| `g_ThreadPlan[kMaxThreads]` | 1024 × 约 128 B ≈ **128 KB** | 冻结后固化的不可变"线程计划"（最多 1024 线程） |
 | `g_KnownMemoryRanges[kMaxThreads+4096]` | 5120 × 16 B ≈ **80 KB** | 已规划区域表（栈/数据段），供间接扫描去重判重叠 |
 | `g_ContextScratch` | `sizeof(CONTEXT)` ≈ **1.2 KB** | 取单个线程寄存器上下文的临时区 |
+| `g_CommentBuffer` | **1 KB** | `CommentStreamA` 的系统/进程内存摘要 ANSI 文本 |
 | 其余计数器/标志/API 表 | < 1 KB | — |
-| **合计** | **≈ 4.2 MB** | 全部为 demand-zero，仅实际触达的页才占物理内存 |
+| **合计** | **≈ 4.3 MB** | 全部为 demand-zero，仅实际触达的页才占物理内存 |
 
 **`g_ScratchBuffer`（4 MB）按阶段复用**（这些用途在时间上互不重叠，故共用一块以压低静态占用）：
 - 阶段一 = `NtQuerySystemInformation` 进程/线程快照的接收缓冲（构建线程计划时一次性消费完）；
@@ -123,7 +174,7 @@ BOOL WriteMiniDumpInproc(
 
 **为什么这么做（设计动机）**：
 1. **崩溃现场不能信任堆与 loader**：进程崩溃时堆可能已损坏、loader 锁可能被持有。任何 `malloc`/`new`/`HeapAlloc`/`LoadLibrary` 都可能死锁或二次崩溃。预分配静态内存让写 dump 全程零分配、零加载，最大化可靠性。
-2. **`.bss` 零成本**：这些数组是零初始化全局，落在 `.bss`，**不增加二进制体积**（磁盘上只是个大小字段），运行期由操作系统按需 demand-zero 提交——没触达的页不占物理内存。所以"4.2 MB"是上限，常态远低于此。
+2. **`.bss` 零成本**：这些数组是零初始化全局，落在 `.bss`，**不增加二进制体积**（磁盘上只是个大小字段），运行期由操作系统按需 demand-zero 提交——没触达的页不占物理内存。所以"4.3 MB"是上限，常态远低于此。
 3. **一致性需要"快照式"存储**：把线程计划/内存区域计划一次性固化到固定数组，是"描述符大小 == 实际字节"一致的前提（见一致性模型）。
 4. **上限可调**：若目标进程线程/模块数或期望的间接内存量更大，可调 `kMaxThreads` / `kMaxModules` / `kScratchBufferSize` 重新编译，按需换取更大静态占用。
 
@@ -133,10 +184,10 @@ BOOL WriteMiniDumpInproc(
 
 机制细节见上文"设计约束"（无堆/无 loader、SEH 容错、一致性模型、并发串行化），此处只补充验证与退化行为：
 
-- **退化而非崩溃**：PEB/LDR 损坏 → 模块表降级为空；线程快照失败 → 至少 dump 当前线程与异常线程；超上限 → 截断但结构合法；坏页 → 补零而非失败。
+- **退化而非崩溃**：PEB/LDR 损坏 → 模块表降级为空；线程快照失败 → 至少 dump 当前线程与异常线程；线程/模块/范围表容量上限 → 结构合法但信息可能不完整；`MaxFileSize` 硬上限不足 → 失败返回 `ERROR_FILE_TOO_LARGE`；坏页 → 补零而非失败。
 - **验证覆盖**：
   - `MiniDumpInprocHeapFailTest`：强制 `HeapAlloc`/`RtlAllocateHeap`/`VirtualAlloc` 等全部返回 `NULL` 时 dump 仍正常产出，证明崩溃路径无堆分配。
-  - `MiniDumpInprocStressTest`：150+ 线程跑空指针写 / 栈溢出 / UAF / 堆破坏 / 数据段按引用收集等场景，产出可被 WinDbg 完整解析的 dump（异常、完整调用栈、全部线程、多层间接内存）。
+  - `MiniDumpInprocStressTest`：150+ 线程跑空指针写 / 栈溢出 / UAF / 堆破坏 / 数据段按引用收集等场景，产出可被 WinDbg 解析的 dump（异常、线程列表/上下文、按预算裁剪的关键栈窗口、多层间接内存）。
 - **残留风险**：见"已知残留风险与限制"。其中 `__fastfail` 类崩溃绕过所有进程内异常处理器（VEH/SEH/UnhandledExceptionFilter 均收不到），进程内无解。
 
 ### 性能
@@ -147,7 +198,7 @@ BOOL WriteMiniDumpInproc(
   - **`VirtualQuery` 单条区域缓存**：聚簇指针落在同一区域时免重复系统调用（崩溃现场指针高度聚簇，命中率高）；
   - **整页一次读**：扫描已收集页时整页拷贝后在本地缓冲遍历，降低逐指针的 SEH 开销；
   - **崩溃线程子树优先**：预算紧张时优先收集与崩溃最相关的数据，避免无效扫描。
-- **预算驱动**：选择性 dump 下 `MaxFileSize` 把数据段/间接内存逐层截断，既控体积也控 I/O 与扫描时间（full memory 不受此约束，见上文）。
+- **预算驱动**：选择性 dump 下 `MaxFileSize` 硬上限会先裁剪栈窗口，再裁剪数据段/间接内存，既控体积也控 I/O 与扫描时间；full memory 超过硬上限则失败。
 - **零分配开销**：无 `malloc`/`free` 往返、无碎片，缓冲首次触达才提交物理页。
 - **成本主项**：`MiniDumpWithFullMemory` 全量 `VirtualQuery` 遍历 + 落盘是最重的；选择性 dump（栈 + 按需间接）通常显著更轻。
 
@@ -171,7 +222,7 @@ BOOL WriteMiniDumpInproc(
 ## 构建
 
 ```powershell
-cd d:\my_work\minidump
+cd <项目根目录>
 cmake -S . -B build -A x64
 cmake --build build --config Release
 ```
@@ -187,14 +238,26 @@ git submodule update --init --recursive
 - `MiniDumpInproc`：库目标
 - `MiniDumpInprocSample`：崩溃写 dump 示例，运行后在当前目录生成 `inproc_sample.dmp`
 - `MiniDumpInprocStressTest`：多线程 + 多种真实崩溃压测（见下），父/子进程模型并自动校验 dump
+- `MiniDumpInspect`：轻量 dump 解读工具，打印 header、stream 类型/大小和关键统计信息（含 `CommentStreamA` 的系统/进程内存摘要文本）
+- `MiniDumpOverflowStackExt.dll`：WinDbg 扩展，提供 `!show_overflow_stack` 自动展示 `STATUS_STACK_OVERFLOW` 的完整栈/双窗口栈
+
+Detours 相关 demo 默认关闭，避免生产/干净环境因 submodule 未初始化而构建失败。需要时显式开启：
+
+```powershell
+cmake -S . -B build -A x64 -DMINIDUMP_INPROC_BUILD_DETOURS_DEMO=ON
+```
+
+开启后额外生成：
+
 - `MiniDumpWriteDumpAllocTrace`：基于 `third_party/Detours` 的 `MiniDumpWriteDump` 内存分配跟踪 demo
 - `MiniDumpInprocHeapFailTest`：基于 Detours 将 `HeapAlloc` / `RtlAllocateHeap` / `VirtualAlloc` 等强制返回 `NULL`，验证 `WriteMiniDumpInproc` 的无堆分配路径
+- `GdiUserHandleAllocTrace`：演示 GDI/USER 句柄计数的获取，并基于 Detours 跟踪 `user32!GetGuiResources` 是否触发用户态堆分配的 Win32 demo（见下）
 
 
 `MiniDumpWriteDumpAllocTrace` 会 hook `HeapCreate` / `HeapAlloc` / `HeapReAlloc` / `HeapFree` / `HeapDestroy` / `VirtualAlloc` / `VirtualFree`，调用系统 `MiniDumpWriteDump` 后输出：新建 heap、落在新建 heap 上的分配事件、其他 heap 事件、VirtualAlloc 计数。运行示例：
 
 ```powershell
-cd d:\my_work\minidump\build\Release
+cd build\Release
 .\MiniDumpWriteDumpAllocTrace.exe trace_test.dmp
 ```
 
@@ -202,18 +265,79 @@ cd d:\my_work\minidump\build\Release
 
 
 ```powershell
-cd d:\my_work\minidump\build\Release
+cd build\Release
 .\MiniDumpInprocHeapFailTest.exe
 ```
 
-`MiniDumpInprocStressTest` 以父/子进程模型逐场景验证稳定性：子进程拉起 150 个工作线程（每个在栈上挂一条 3 层指针链，专门喂给多层间接扫描），用**独立大栈的 dump 线程**写 dump（崩溃线程仅在过滤器里发信号 + 等待，从而即使栈溢出也能写出——这正是推荐的栈溢出处理范式），再触发真实崩溃：空指针写、栈溢出、释放后使用、堆元数据破坏；父进程随后解析 dump 校验 header、流集合并确认捕获了 100+ 线程。此外还有一个 `datasegs_indirect` 场景专门验证"数据段按引用收集"：进程持有一个 8MB 全局块，仅在崩溃线程栈上放一个指向其中某页的指针，dump 时**只带 `MiniDumpWithIndirectlyReferencedMemory`、不带 `MiniDumpWithDataSegs`**；父进程断言该被引用页的 magic 在 dump 中**存在**、而一个无人引用的远端页 magic **不存在**（证明全局块未被整段灌入，只按引用收了触达页）。运行示例：
+`GdiUserHandleAllocTrace` 演示 GDI/USER 句柄计数的获取方式，并验证采集这些计数的 `user32!GetGuiResources` 是否在用户态分配堆。它先创建一批真实 GDI 对象（DC / pen / brush / font / bitmap / region）与 USER 对象（隐藏窗口 / 菜单 / 图标）让计数明显变化，再用 Detours hook `HeapAlloc` / `HeapReAlloc` / `RtlAllocateHeap` / `RtlReAllocateHeap` / `VirtualAlloc`，并按"线程 + 时间窗口"过滤，精确统计**单次 `GetGuiResources` 调用期间本线程**的分配次数（排除后台线程噪声）。实测每次调用的分配计数均为 0，证明 `GetGuiResources` **不做用户态堆分配**，因此可安全用于崩溃路径的 `CommentStreamA`。运行示例：
 
 ```powershell
-cd d:\my_work\minidump\build\Release
+cd build\Release
+.\GdiUserHandleAllocTrace.exe
+```
+
+`MiniDumpInprocStressTest` 以父/子进程模型逐场景验证稳定性：子进程拉起 150 个工作线程（每个在栈上挂一条 3 层指针链，专门喂给多层间接扫描），用**独立大栈的 dump 线程**写 dump（崩溃线程仅在过滤器里发信号 + 等待，从而即使栈溢出也能写出——这正是推荐的栈溢出处理范式），再触发真实崩溃：空指针写、4 种保留栈大小的栈溢出（256KB / 1MB / 2MB / 4MB）、释放后使用、堆元数据破坏。父进程随后解析 dump 校验 header、流集合并确认捕获了 100+ 线程。此外还覆盖：
+
+- `datasegs_indirect`：验证"数据段按引用收集"。进程持有一个 8MB 全局块，仅在崩溃线程栈上放一个指向其中某页的指针，dump 时**只带 `MiniDumpWithIndirectlyReferencedMemory`、不带 `MiniDumpWithDataSegs`**；父进程断言该被引用页的 magic 在 dump 中**存在**、而一个无人引用的远端页 magic **不存在**。
+- `indirect_object_graph`：验证多层对象图间接引用。崩溃栈只保留 root 指针，root -> child -> grandchild 三页对象必须都被多层扫描展开捕获。
+- `type_*` 场景：覆盖 `MiniDumpNormal`、`MiniDumpWithThreadInfo` / `MiniDumpWithProcessThreadData`、`MiniDumpWithFullMemoryInfo`、`MiniDumpWithDataSegs`、`MiniDumpWithIndirectlyReferencedMemory`、`MiniDumpWithFullMemory` 等组合。
+
+> 构建说明：`MiniDumpInprocStressTest` 作为调试/验证 demo，CMake 对其**关闭优化**（`/Od /Ob0 /Oy-`，在所有配置生效），以便在 Release / RelWithDebInfo 产出的 dump 里用 WinDbg `dv` 正常查看栈上局部变量（例如核对 `indirect_object_graph` 的 root/child/grandchild 指针）。优化开启时编译器会把这些变量放进寄存器或直接消除，`dv` 将看不到它们的值。该设置只作用于这一个 demo target，库 `MiniDumpInproc` 与其它目标不受影响。
+
+运行示例：
+
+```powershell
+cd build\Release
 .\MiniDumpInprocStressTest.exe
 ```
 
 > 说明：堆元数据破坏在现代 Windows 上通常走 `__fastfail` 快速失败，**绕过所有进程内异常处理器**（VEH/SEH/UnhandledExceptionFilter 均收不到），因此这类崩溃在进程内无法写 dump——这是进程内方案的根本限制，压测里以 `INFO` 标记而非失败。
+
+`MiniDumpInspect` 用于快速查看 dump 结构：
+
+```powershell
+cd build\Release
+.\MiniDumpInspect.exe .\inproc_stress_stack_overflow_4m.dmp
+```
+
+### 用 WinDbg 扩展展示栈溢出逻辑调用栈
+
+`STATUS_STACK_OVERFLOW` 且原始栈空间大于 1 MB 时，dump 会保留两段栈：异常 `SP/RSP` 附近的 live unwind 窗口，以及靠近 `StackBase` 的高地址栈顶窗口。由于中间栈帧被故意丢弃，WinDbg 原生 `k/kb/kp` 通常只能从当前 `RSP` 连续回溯 live 窗口；本工程提供 `MiniDumpOverflowStackExt.dll`，用 `!show_overflow_stack` 自动把两段窗口合成为更接近真实逻辑的栈：
+
+```text
+.load <项目根目录>\build\RelWithDebInfo\MiniDumpOverflowStackExt.dll
+!show_overflow_stack
+```
+
+输出类似 `kn`，每帧包含序号、`Child-SP`、`RetAddr`、`module!symbol+0xNN` 和源码位置：
+
+```text
+ # Child-SP          RetAddr           Call Site [Source]
+00 0000009c`76613310 00007ff7`064ab367 MiniDumpInprocStressTest!__chkstk+0x37 [...\chkstk.asm @ 108]
+01 0000009c`76613328 00007ff7`064a2e6e MiniDumpInprocStressTest!`anonymous namespace'::RecurseUntilStackOverflow+0xd [...\inproc_stress_test.cpp @ 171]
+02 0000009c`76613330 00007ff7`064a2ec1 MiniDumpInprocStressTest!`anonymous namespace'::RecurseUntilStackOverflow+0x60 [...\inproc_stress_test.cpp @ 175]
+... (N repeated frames in M cycles) ...
+... <0x... bytes of middle stack intentionally omitted> ...
+   MiniDumpInprocStressTest!`anonymous namespace'::StackOverflowThreadProc+0x1d [...\inproc_stress_test.cpp @ 183]
+   KERNEL32!BaseThreadInitThunk+0x16
+   ntdll!RtlUserThreadStart+0x2b
+```
+
+说明：
+
+- 对 `256 KB / 1 MB` 这类完整记录的栈，命令扫描 `SP/RSP` 到 `StackBase` 的完整窗口；对 `2 MB` 或更大的裁剪栈，扫描 live 窗口 + 高地址栈顶窗口，并自动过滤陈旧的 thread-start 伪栈。
+- **重复递归帧折叠**：自动识别周期为 1~4 的重复帧块（普通递归周期 1，优化后常见的双调用点交替递归周期 2），折叠为 `... (N repeated frames in M cycles) ...`，仅保留首尾各一个完整周期。
+- `Child-SP` / `RetAddr` 与原生 `kn` 对齐（`hi`lo` 反引号格式）。**源码行解析与符号在同一地址进行**，与 `kn` 一致：帧 0（崩溃 IP，不是返回地址）用精确地址（如 `__chkstk` 显示 `@ 109`），其余返回地址帧用 `retAddr-1`（call 指令所在行，如 `@ 171/175`）。注：返回地址帧的符号偏移按 `retAddr-1` 标注到 call 指令（如 `+0xd`），比 `kn` 显示的返回点偏移（`+0xe`）小 1，但行号一致。
+- 输出使用 DML 可点击链接（命令里的地址统一用 `hi`lo` 反引号完整地址，避免 `0x...` 被当成 32 位触发 Range error）：
+  - 帧序号 → `dps <Child-SP> L10`，查看该帧栈区域。注意：原生 `k` 的帧号点击是 `.frame 0n<idx>;dv /t /v`，依赖 WinDbg 自身的 unwind 帧表；本命令的帧是扫描栈内存合成的、不在该帧表里，`.frame` 无法选中（`.frame /r <地址>` 接收的是帧号而非地址，会报 Range error），因此退化为 `dps` 展示该帧栈区域。
+  - `Call Site`（符号）→ 反汇编该返回地址附近指令；
+  - `Source` → `lsa <retAddr-1>`，跳转到对应源码行。
+- 可选参数：
+  - `live=<bytes>` / `high=<bytes>`：调整 > 1MB 栈的 live / 高地址窗口大小（默认 512KB / 512KB，支持 `k`/`m` 后缀）。
+  - `shadow[=<bytes>]`：每帧额外打印一段影子栈窗口（默认 32 字节，可点开 `dps`）。
+  - `noecxr`：不自动执行 `.ecxr`。
+
+> 注意：命令通过扫描 dump 里保留的栈内存窗口合成逻辑栈。被裁剪的中间帧没有真实 unwind 上下文，因此帧数会比原生 `k` 多（每个递归层的多个返回地址槽都会被列出），也无法可靠还原 `kp` 的参数列表；`Child-SP/RetAddr/符号/源码行/影子栈` 均可正确展示。
 
 
 如不需要示例：
@@ -231,6 +355,8 @@ cmake -S . -B build -A x64 -DMINIDUMP_INPROC_BUILD_SAMPLE=OFF
 // 无需显式初始化：库在模块加载时（全局构造）自动预解析所需 ntdll 例程。
 // 若该预解析未完成，WriteMiniDumpInproc 会返回 FALSE（ERROR_NOT_READY），
 // 崩溃路径绝不回退到 GetProcAddress 等 loader 调用。
+// 可选：若担心跨 cpp/DLL 的全局初始化顺序，可在自己的初始化里先调用
+// ResolveInprocApis()（幂等、可重复调用）以确保预解析在确定时机完成。
 
 LONG WINAPI Filter(PEXCEPTION_POINTERS ep)
 {
@@ -247,8 +373,8 @@ LONG WINAPI Filter(PEXCEPTION_POINTERS ep)
     mei.ClientPointers = FALSE;   // 必须为 FALSE：本实现是进程内自 dump，
                                   // 传 TRUE 会被拒绝（返回 ERROR_INVALID_PARAMETER）。
 
-    // 第 4 个参数是 dmp 文件大小软上限（字节），0 表示不限制。
-    // 注意：MiniDumpWithFullMemory 会忽略该上限（保留全部内存，避免误丢线程栈）。
+    // 第 4 个参数是 dmp 文件大小硬上限（字节）；小于 4 MB（含 0）按 4 MB 处理。
+    // 注意：MiniDumpWithFullMemory 超过硬上限会失败，不会静默截断。
     (void)WriteMiniDumpInproc(hFile, MiniDumpNormal, &mei, 0);
     CloseHandle(hFile);
     return EXCEPTION_EXECUTE_HANDLER;

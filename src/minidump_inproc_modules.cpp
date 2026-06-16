@@ -15,7 +15,7 @@ BOOL CountModules(ULONG32* moduleCount, ULONG32* nameBytes, ULONG32* codeViewByt
     ULONG64 names = 0;
     ULONG64 codeView = 0;
 
-    if (peb == nullptr || !SafeCopyBytes(&ldr, &peb->Ldr, sizeof(ldr)) || ldr == nullptr) {
+    if (peb == nullptr || !SafeCopyBytes(&ldr, &peb->Ldr, sizeof(PVOID)) || ldr == nullptr) {
         *moduleCount = 0;
         *nameBytes = 0;
         *codeViewBytes = 0;
@@ -23,7 +23,7 @@ BOOL CountModules(ULONG32* moduleCount, ULONG32* nameBytes, ULONG32* codeViewByt
     }
 
     head = &ldr->InMemoryOrderModuleList;
-    if (!SafeCopyBytes(&current, &head->Flink, sizeof(current))) {
+    if (!SafeCopyBytes(&current, &head->Flink, sizeof(PVOID))) {
         *moduleCount = 0;
         *nameBytes = 0;
         *codeViewBytes = 0;
@@ -41,14 +41,14 @@ BOOL CountModules(ULONG32* moduleCount, ULONG32* nameBytes, ULONG32* codeViewByt
         if (!SafeCopyBytes(&name, &entry->FullDllName, sizeof(name))) {
             break;
         }
-        (void)SafeCopyBytes(&moduleBase, &entry->DllBase, sizeof(moduleBase));
+        (void)SafeCopyBytes(&moduleBase, &entry->DllBase, sizeof(PVOID));
         if (QueryModuleCodeViewRecord(moduleBase, &cvRecord, &cvSize)) {
             codeView += Align4(cvSize);
         }
         names += MinidumpStringSize(SafeModuleNameLength(&entry->FullDllName));
         ++count;
 
-        if (!SafeCopyBytes(&next, &current->Flink, sizeof(next))) {
+        if (!SafeCopyBytes(&next, &current->Flink, sizeof(PVOID))) {
             break;
         }
         current = next;
@@ -175,7 +175,7 @@ BOOL WriteModuleCodeViewRecord(HANDLE hFile, PVOID moduleBase, ULONG32* writtenS
     if (!QueryModuleCodeViewRecord(moduleBase, &record, &recordSize)) {
         return TRUE;
     }
-    if (!WriteAll(hFile, record, recordSize)) {
+    if (!WriteRegionBytes(hFile, const_cast<BYTE*>(record), recordSize)) {
         return FALSE;
     }
     ULONG32 paddedSize = static_cast<ULONG32>(Align4(recordSize));
@@ -204,12 +204,12 @@ BOOL WriteModuleList(HANDLE hFile, ULONG32 moduleCount, ULONG32 moduleListRva) n
         return FALSE;
     }
 
-    if (peb == nullptr || !SafeCopyBytes(&ldr, &peb->Ldr, sizeof(ldr)) || ldr == nullptr) {
+    if (peb == nullptr || !SafeCopyBytes(&ldr, &peb->Ldr, sizeof(PVOID)) || ldr == nullptr) {
         return TRUE;
     }
 
     head = &ldr->InMemoryOrderModuleList;
-    if (!SafeCopyBytes(&current, &head->Flink, sizeof(current))) {
+    if (!SafeCopyBytes(&current, &head->Flink, sizeof(PVOID))) {
         return TRUE;
     }
 
@@ -221,7 +221,7 @@ BOOL WriteModuleList(HANDLE hFile, ULONG32 moduleCount, ULONG32 moduleListRva) n
         ULONG32 nameLength = SafeModuleNameLength(&entry->FullDllName);
         cvRva += MinidumpStringSize(nameLength);
         ++scannedModules;
-        if (!SafeCopyBytes(&next, &rvaScan->Flink, sizeof(next))) {
+        if (!SafeCopyBytes(&next, &rvaScan->Flink, sizeof(PVOID))) {
             break;
         }
         rvaScan = next;
@@ -240,7 +240,7 @@ BOOL WriteModuleList(HANDLE hFile, ULONG32 moduleCount, ULONG32 moduleListRva) n
         const BYTE* cvRecord = nullptr;
         ULONG32 cvSize = 0;
 
-        (void)SafeCopyBytes(&moduleBase, &entry->DllBase, sizeof(moduleBase));
+        (void)SafeCopyBytes(&moduleBase, &entry->DllBase, sizeof(PVOID));
         (void)SafeCopyBytes(&module.BaseOfImage, &entry->DllBase, sizeof(entry->DllBase));
 
         (void)SafeCopyBytes(&module.SizeOfImage, &entry->SizeOfImage, sizeof(entry->SizeOfImage));
@@ -268,7 +268,7 @@ BOOL WriteModuleList(HANDLE hFile, ULONG32 moduleCount, ULONG32 moduleListRva) n
         stringRva += MinidumpStringSize(nameLength);
         ++writtenModules;
 
-        if (!SafeCopyBytes(&next, &current->Flink, sizeof(next))) {
+        if (!SafeCopyBytes(&next, &current->Flink, sizeof(PVOID))) {
             break;
         }
         current = next;
@@ -285,7 +285,7 @@ BOOL WriteModuleList(HANDLE hFile, ULONG32 moduleCount, ULONG32 moduleListRva) n
 
     current = nullptr;
     writtenModules = 0;
-    if (!SafeCopyBytes(&current, &head->Flink, sizeof(current))) {
+    if (!SafeCopyBytes(&current, &head->Flink, sizeof(PVOID))) {
         return WriteZeros(hFile, stringRva - stringPos.QuadPart);
     }
 
@@ -298,7 +298,7 @@ BOOL WriteModuleList(HANDLE hFile, ULONG32 moduleCount, ULONG32 moduleListRva) n
         }
         ++writtenModules;
 
-        if (!SafeCopyBytes(&next, &current->Flink, sizeof(next))) {
+        if (!SafeCopyBytes(&next, &current->Flink, sizeof(PVOID))) {
             break;
         }
         current = next;
@@ -314,7 +314,7 @@ BOOL WriteModuleList(HANDLE hFile, ULONG32 moduleCount, ULONG32 moduleListRva) n
 
     current = nullptr;
     writtenModules = 0;
-    if (!SafeCopyBytes(&current, &head->Flink, sizeof(current))) {
+    if (!SafeCopyBytes(&current, &head->Flink, sizeof(PVOID))) {
         return TRUE;
     }
 
@@ -324,13 +324,13 @@ BOOL WriteModuleList(HANDLE hFile, ULONG32 moduleCount, ULONG32 moduleListRva) n
         PVOID moduleBase = nullptr;
         ULONG32 writtenSize = 0;
 
-        (void)SafeCopyBytes(&moduleBase, &entry->DllBase, sizeof(moduleBase));
+        (void)SafeCopyBytes(&moduleBase, &entry->DllBase, sizeof(PVOID));
         if (!WriteModuleCodeViewRecord(hFile, moduleBase, &writtenSize)) {
             return FALSE;
         }
         ++writtenModules;
 
-        if (!SafeCopyBytes(&next, &current->Flink, sizeof(next))) {
+        if (!SafeCopyBytes(&next, &current->Flink, sizeof(PVOID))) {
             break;
         }
         current = next;

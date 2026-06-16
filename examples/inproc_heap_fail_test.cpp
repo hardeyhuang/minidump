@@ -16,7 +16,7 @@
 #include <stdio.h>
 #include <strsafe.h>
 
-#include "D:/tools/Detours/src/detours.h"
+#include "../third_party/Detours/src/detours.h"
 
 #if defined(__clang__)
 #pragma clang diagnostic ignored "-Wmicrosoft-cast"

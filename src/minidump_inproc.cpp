@@ -1,5 +1,6 @@
 #include "minidump_inproc.h"
 #include "minidump_inproc_internal.h"
+#include <errhandlingapi.h>
 
 
 namespace minidump_inproc::internal {
@@ -26,19 +27,20 @@ BOOL WriteMiniDumpInprocImpl(
     BOOL hasException = FALSE;
     MINIDUMP_EXCEPTION_STREAM exceptionProbe = {};
     const CONTEXT* contextProbe = nullptr;
-    ULONG32 streamCount = 5;
+    ULONG32 streamCount = 6;
     ULONG32 streamIndex = 0;
 
     // The crash path must never resolve exports lazily (GetModuleHandleW/GetProcAddress can take
     // the loader lock, which may already be held or corrupted at crash time). We depend entirely on
-    // the load-time auto-initializer (AutoInitInprocApis) having pre-resolved the NTDLL routines. If
-    // it somehow did not run (extremely unusual init ordering), we fail outright rather than touching
-    // the loader from the crash path.
+    // the load-time auto-initializer (AutoInitInprocApis) having cached system information and
+    // pre-resolved the NTDLL routines. If it somehow did not run (extremely unusual init ordering),
+    // we fail outright rather than touching the loader from the crash path.
     if (g_ApisInitialized == 0) {
         SetLastError(ERROR_NOT_READY);
         return FALSE;
     }
 
+    const ULONG64 hardMaxFileSize = NormalizeHardMaxFileSize(maxFileSize);
     ULONG64 requestedFlags = static_cast<ULONG64>(dumpType) & MiniDumpValidTypeFlags;
     const BOOL writeFullMemory = (requestedFlags & MiniDumpWithFullMemory) != 0;
     const BOOL writeMemoryInfo = (requestedFlags & MiniDumpWithFullMemoryInfo) != 0;
@@ -52,7 +54,7 @@ BOOL WriteMiniDumpInprocImpl(
     const BOOL writeSelectedMemory = !writeFullMemory;
 
     ULONG32 headerRva = 0, directoryRva = sizeof(MINIDUMP_HEADER);
-    ULONG32 systemInfoRva = 0, miscInfoRva = 0, moduleListRva = 0, threadListRva = 0;
+    ULONG32 systemInfoRva = 0, miscInfoRva = 0, commentRva = 0, moduleListRva = 0, threadListRva = 0;
     ULONG32 threadInfoListRva = 0, memoryInfoListRva = 0, memoryListRva = 0;
     ULONG32 exceptionRva = 0, threadContextsRva = 0, contextRva = 0;
     ULONG64 memoryBaseRva = 0;
@@ -69,11 +71,16 @@ BOOL WriteMiniDumpInprocImpl(
     LARGE_INTEGER pos = {};
 
     hasException = CaptureExceptionStreamInfo(exceptionParam, &exceptionProbe, &contextProbe);
-    // streamCount already accounts for the 5 always-present streams:
-    // SystemInfo, MiscInfo, ModuleList, ThreadList and the (Memory|Memory64) list.
+    // streamCount already accounts for the 6 always-present streams: SystemInfo, MiscInfo,
+    // CommentStreamA, ModuleList, ThreadList and the (Memory|Memory64) list.
     if (hasException) { ++streamCount; exceptionStreamSize = sizeof(MINIDUMP_EXCEPTION_STREAM); }
     if (writeThreadInfo) ++streamCount;
     if (writeMemoryInfo) ++streamCount;
+
+    // Build the ANSI comment text (system + process memory summary) before file layout so its size
+    // is fixed. The query is heap-free and SEH-guarded, and always yields a valid NUL-terminated
+    // string, so the reserved directory size stays correct even if the queries fail.
+    const ULONG32 commentStreamSize = BuildMemoryCommentText();
 
     // Freeze every other thread and snapshot the process exactly once. All later passes read this
     // immutable plan, which is what keeps descriptor counts/sizes consistent with the byte streams.
@@ -100,14 +107,15 @@ BOOL WriteMiniDumpInprocImpl(
     threadInfoListSize64 = sizeof(MINIDUMP_THREAD_INFO_LIST) + static_cast<ULONG64>(threadCount) * sizeof(MINIDUMP_THREAD_INFO);
     memoryInfoListSize64 = sizeof(MINIDUMP_MEMORY_INFO_LIST) + memoryInfoRangeCount * sizeof(MINIDUMP_MEMORY_INFO);
 
-    // Soft size budget. Mandatory data is always written; only truncatable memory content is
-    // trimmed, and only for selected-memory dumps (see the writeFullMemory branch: MaxFileSize is
-    // ignored for full-memory dumps so that thread stacks are never dropped by address-order cutoff).
+    // Hard size budget. Fixed metadata must fit; selected-memory dumps then add stack windows and
+    // optional memory by priority. Full-memory dumps keep complete full-memory semantics and fail if
+    // the complete range set would exceed the cap.
     const ULONG64 fixedSize =
         sizeof(MINIDUMP_HEADER) +
         static_cast<ULONG64>(streamCount) * sizeof(MINIDUMP_DIRECTORY) +
         sizeof(MINIDUMP_SYSTEM_INFO) +
         sizeof(MINIDUMP_MISC_INFO) +
+        commentStreamSize +
         moduleListStorageSize +
         threadListStreamSize +
         threadContextsSize64 +
@@ -116,31 +124,32 @@ BOOL WriteMiniDumpInprocImpl(
         (writeMemoryInfo ? memoryInfoListSize64 : 0);
 
     if (writeFullMemory) {
-        // IMPORTANT: MaxFileSize is intentionally IGNORED for MiniDumpWithFullMemory.
-        //
         // Full-memory dumps use the 64-bit Memory64List and are meant to capture the COMPLETE set of
-        // committed/readable regions. Applying a byte budget here would truncate by VirtualQuery
-        // address order (low -> high); because thread stacks usually live at high addresses, a small
-        // MaxFileSize could silently drop thread stacks while keeping low-address regions -- breaking
-        // call-stack reconstruction, which is exactly what callers of a full-memory dump need most.
-        //
-        // So when MiniDumpWithFullMemory is requested we keep EVERY captured range regardless of
-        // MaxFileSize. Callers who need a size cap should use a selected-memory dump instead (where
-        // stacks are mandatory and only DataSegs / indirect memory are trimmed against the budget).
-        CaptureFullMemoryRanges();
+        // committed/readable regions. We never truncate that set by address order; the production hard
+        // MaxFileSize is enforced by failing cleanly if the complete full-memory dump would exceed the cap.
+        if (!CaptureFullMemoryRanges()) {
+            return FALSE;
+        }
         fullMemoryRangeCount = g_FullMemoryRangeCount;
     } else {
         // The MemoryList stream addresses each region's bytes with a 32-bit RVA, so a selected-memory
         // dump must stay under 4 GB or those RVAs would silently truncate and corrupt the file. We
-        // therefore clamp the effective budget to just under 4 GB (and honor a smaller MaxFileSize if
-        // given), trimming data segments / indirect memory before any RVA can overflow. Full-memory
-        // dumps use the 64-bit Memory64List and are not subject to this limit.
+        // clamp the effective hard budget to just under 4 GB, then trim stack windows and optional
+        // memory by production priority before any RVA can overflow.
         constexpr ULONG64 kSelectedDumpRvaLimit = 0xFFFF0000ULL; // < 4 GB, with headroom for padding
         const ULONG64 effectiveBudget =
-            (maxFileSize != 0 && maxFileSize < kSelectedDumpRvaLimit) ? maxFileSize : kSelectedDumpRvaLimit;
+            hardMaxFileSize < kSelectedDumpRvaLimit ? hardMaxFileSize : kSelectedDumpRvaLimit;
 
-        // Thread stacks are the highest-value selected memory; include them when available. On a
-        // counting failure we degrade to zero stacks instead of aborting the dump.
+        if (!ApplyThreadStackCapturePolicy(preferredThreadId,
+                                           hasException ? exceptionProbe.ExceptionRecord.ExceptionCode : 0,
+                                           contextProbe,
+                                           fixedSize,
+                                           effectiveBudget)) {
+            return FALSE;
+        }
+
+        // Thread stacks are the highest-value selected memory; include only windows kept by the
+        // production stack policy and hard-size priority order.
         if (!CountStackMemoryRanges(threadCount, &stackRangeCount, &stackBytes)) {
             stackRangeCount = 0; stackBytes = 0;
         }
@@ -190,6 +199,11 @@ BOOL WriteMiniDumpInprocImpl(
         ? sizeof(ULONG64) + sizeof(ULONG64) + fullMemoryRangeCount * sizeof(MINIDUMP_MEMORY_DESCRIPTOR64)
         : sizeof(ULONG32) + selectedMemoryRangeCount * sizeof(MINIDUMP_MEMORY_DESCRIPTOR);
 
+    if (writeFullMemory && fixedSize + memoryListSize64 + g_FullMemoryBytes > hardMaxFileSize) {
+        SetLastError(ERROR_FILE_TOO_LARGE);
+        return FALSE;
+    }
+
     if (threadContextsSize64 > 0xffffffffULL || threadInfoListSize64 > 0xffffffffULL ||
         memoryInfoListSize64 > 0xffffffffULL || memoryListSize64 > 0xffffffffULL) {
         SetLastError(ERROR_FILE_TOO_LARGE);
@@ -204,12 +218,13 @@ BOOL WriteMiniDumpInprocImpl(
     // order regions are physically laid out on disk. Doing the full layout before writing lets each
     // stream's directory entry point at a fixed, final offset, and lets us write streams with simple
     // SetFilePointerEx seeks (so a skipped/faulting stream cannot shift any other stream's position).
-    // Physical order: header -> directory -> SystemInfo -> MiscInfo -> ModuleList(+strings/CV) ->
-    // ThreadList -> [ThreadInfoList] -> [MemoryInfoList] -> Memory(64)List descriptors ->
-    // [Exception] -> thread CONTEXT records -> memory bytes backing store.
+    // Physical order: header -> directory -> SystemInfo -> MiscInfo -> CommentStreamA ->
+    // ModuleList(+strings/CV) -> ThreadList -> [ThreadInfoList] -> [MemoryInfoList] ->
+    // Memory(64)List descriptors -> [Exception] -> thread CONTEXT records -> memory bytes backing store.
     ULONG32 nextRva = directoryRva + streamCount * sizeof(MINIDUMP_DIRECTORY);
     systemInfoRva = nextRva; nextRva += sizeof(MINIDUMP_SYSTEM_INFO);
     miscInfoRva = nextRva; nextRva += sizeof(MINIDUMP_MISC_INFO);
+    commentRva = nextRva; nextRva += commentStreamSize;
     moduleListRva = nextRva; nextRva += moduleListStorageSize;
     threadListRva = nextRva; nextRva += threadListStreamSize;
     if (writeThreadInfo) { threadInfoListRva = nextRva; nextRva += threadInfoListSize; }
@@ -225,19 +240,16 @@ BOOL WriteMiniDumpInprocImpl(
     // last thing in the file, streamed after all fixed-size structures are placed.
     memoryBaseRva = nextRva;
 
-    // HARD 4 GB GUARD for selected-memory dumps. MINIDUMP_MEMORY_DESCRIPTOR.Memory.Rva is 32-bit, so
-    // every selected region's bytes must start below 4 GB. The earlier effectiveBudget only trims the
-    // OPTIONAL layers (DataSegs / indirect memory); mandatory thread stacks are written unconditionally
-    // and could, in pathological cases (e.g. thousands of large stacks), by themselves push the byte
-    // backing store past 4 GB. Rather than emit a silently RVA-truncated, corrupt dump, we recompute
-    // the final byte-store extent in full 64-bit precision here and fail cleanly if it would overflow.
-    // (Full-memory dumps use the 64-bit Memory64List and are exempt from this limit.)
+    // HARD SIZE GUARD for selected-memory dumps. MINIDUMP_MEMORY_DESCRIPTOR.Memory.Rva is 32-bit, so
+    // every selected region's bytes must start below 4 GB and the final file must stay within the
+    // production MaxFileSize cap. Rather than emit a silently truncated corrupt dump, re-check the
+    // final byte-store extent in full 64-bit precision here.
     if (writeSelectedMemory) {
         // nextRva is a 32-bit running cursor; reconstruct the byte-store end in 64-bit from the fixed
         // base and the selected byte totals so a wrapped cursor cannot hide the overflow.
         const ULONG64 selectedMemoryBytes = stackBytes + extraBytes + indirectBytes;
         const ULONG64 memoryEndRva64 = memoryBaseRva + selectedMemoryBytes;
-        if (memoryBaseRva > 0xffffffffULL || memoryEndRva64 > 0xffffffffULL) {
+        if (memoryBaseRva > 0xffffffffULL || memoryEndRva64 > 0xffffffffULL || memoryEndRva64 > hardMaxFileSize) {
             SetLastError(ERROR_FILE_TOO_LARGE);
             return FALSE;
         }
@@ -256,6 +268,10 @@ BOOL WriteMiniDumpInprocImpl(
     directories[streamIndex].StreamType = MiscInfoStream;
     directories[streamIndex].Location.Rva = miscInfoRva;
     directories[streamIndex].Location.DataSize = sizeof(MINIDUMP_MISC_INFO);
+    ++streamIndex;
+    directories[streamIndex].StreamType = CommentStreamA;
+    directories[streamIndex].Location.Rva = commentRva;
+    directories[streamIndex].Location.DataSize = commentStreamSize;
     ++streamIndex;
     directories[streamIndex].StreamType = ModuleListStream;
     directories[streamIndex].Location.Rva = moduleListRva;
@@ -302,11 +318,15 @@ BOOL WriteMiniDumpInprocImpl(
     // file-I/O failure (bad handle, disk full) still aborts, since nothing further can be written.
     BOOL ioFailed = FALSE;
 #if defined(_MSC_VER)
-#define INPROC_EMIT_STREAM(seekRva, writeExpr)                                              \
+#define INPROC_EMIT_STREAM_RESULT(seekRva, writeResultExpr)                                  \
     do {                                                                                     \
         __try {                                                                              \
             pos.QuadPart = static_cast<LONGLONG>(seekRva);                                   \
-            if (!SetFilePointerEx(hFile, pos, nullptr, FILE_BEGIN) || !(writeExpr)) {        \
+            INPROC_STREAM_WRITE_RESULT streamResult = InprocStreamIoFailed;                  \
+            if (SetFilePointerEx(hFile, pos, nullptr, FILE_BEGIN)) {                         \
+                streamResult = (writeResultExpr);                                            \
+            }                                                                                \
+            if (streamResult == InprocStreamIoFailed) {                                      \
                 ioFailed = TRUE;                                                             \
             }                                                                                \
         } __except (SwallowMiniDumpFault(GetExceptionCode())) {                              \
@@ -314,18 +334,27 @@ BOOL WriteMiniDumpInprocImpl(
         }                                                                                    \
         if (ioFailed) return FALSE;                                                          \
     } while (0)
-#else
 #define INPROC_EMIT_STREAM(seekRva, writeExpr)                                              \
+    INPROC_EMIT_STREAM_RESULT((seekRva), StreamResultFromBool((writeExpr)))
+#else
+#define INPROC_EMIT_STREAM_RESULT(seekRva, writeResultExpr)                                  \
     do {                                                                                     \
         pos.QuadPart = static_cast<LONGLONG>(seekRva);                                       \
-        if (!SetFilePointerEx(hFile, pos, nullptr, FILE_BEGIN) || !(writeExpr)) {            \
+        if (!SetFilePointerEx(hFile, pos, nullptr, FILE_BEGIN)) {                            \
+            return FALSE;                                                                    \
+        }                                                                                    \
+        INPROC_STREAM_WRITE_RESULT streamResult = (writeResultExpr);                         \
+        if (streamResult == InprocStreamIoFailed) {                                          \
             return FALSE;                                                                    \
         }                                                                                    \
     } while (0)
+#define INPROC_EMIT_STREAM(seekRva, writeExpr)                                              \
+    INPROC_EMIT_STREAM_RESULT((seekRva), StreamResultFromBool((writeExpr)))
 #endif
 
     INPROC_EMIT_STREAM(systemInfoRva, WriteSystemInfo(hFile));
     INPROC_EMIT_STREAM(miscInfoRva, WriteMiscInfo(hFile));
+    INPROC_EMIT_STREAM_RESULT(commentRva, WriteCommentStream(hFile, commentStreamSize));
     INPROC_EMIT_STREAM(moduleListRva, WriteModuleList(hFile, moduleCount, moduleListRva));
     INPROC_EMIT_STREAM(threadListRva, WriteThreadList(hFile, threadCount, threadContextsRva, \
         memoryBaseRva, writeSelectedMemory));
@@ -342,7 +371,7 @@ BOOL WriteMiniDumpInprocImpl(
             stackRangeCount, extraRangeCount, indirectRangeCount, memoryBaseRva));
     }
     if (hasException) {
-        INPROC_EMIT_STREAM(exceptionRva, WriteExceptionStream(hFile, contextRva, exceptionParam));
+        INPROC_EMIT_STREAM_RESULT(exceptionRva, WriteExceptionStream(hFile, contextRva, &exceptionProbe));
     }
     INPROC_EMIT_STREAM(threadContextsRva, WriteThreadContexts(hFile, threadCount, exceptionParam));
     if (writeFullMemory) {
@@ -351,6 +380,7 @@ BOOL WriteMiniDumpInprocImpl(
         INPROC_EMIT_STREAM(memoryBaseRva, WriteSelectedMemoryBytes(hFile, threadCount, includeDataSegs, indirectRangeCount));
     }
 #undef INPROC_EMIT_STREAM
+#undef INPROC_EMIT_STREAM_RESULT
 
     return TRUE;
 }
@@ -367,6 +397,15 @@ LONG WINAPI SwallowMiniDumpFault(DWORD code) noexcept
 
 } // namespace minidump_inproc::internal
 
+// Optional explicit initialization (see header). Lets callers force system-info caching and NTDLL
+// entry-point resolution at a well-defined point instead of relying on cross-translation-unit
+// global-constructor ordering. Delegates to the internal resolver, which is itself idempotent and
+// no-ops after the first successful resolution, so this is safe to call any number of times.
+extern "C" MINIDUMP_INPROC_API void WINAPI ResolveInprocApis(void) noexcept
+{
+    minidump_inproc::internal::ResolveInprocApis();
+}
+
 // Public crash-path writer. The caller owns file creation and lifetime; this function only
 // serializes minidump streams and converts unexpected access violations into FALSE. The required
 // NTDLL routines are resolved automatically at module load, so no explicit init call is needed.
@@ -378,14 +417,6 @@ extern "C" MINIDUMP_INPROC_API BOOL WINAPI WriteMiniDumpInproc(
 {
     if (hFile == nullptr || hFile == INVALID_HANDLE_VALUE) {
         SetLastError(ERROR_INVALID_HANDLE);
-        return FALSE;
-    }
-
-    // The crash-path APIs must already be pre-resolved at module load (AutoInitInprocApis). We never
-    // fall back to GetModuleHandleW/GetProcAddress on the crash path, so if initialization did not
-    // happen we fail here instead of risking the loader lock.
-    if (minidump_inproc::internal::g_ApisInitialized == 0) {
-        SetLastError(ERROR_NOT_READY);
         return FALSE;
     }
 

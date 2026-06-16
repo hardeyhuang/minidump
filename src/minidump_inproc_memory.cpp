@@ -6,27 +6,31 @@ namespace minidump_inproc::internal {
 // in a single VirtualQuery walk. Both the descriptor pass and the byte pass replay this fixed
 // plan, so they can never disagree on count or size even if the live address space changes.
 
-void CaptureFullMemoryRanges() noexcept
+BOOL CaptureFullMemoryRanges() noexcept
 {
-    SYSTEM_INFO sys = {};
     MEMORY_BASIC_INFORMATION mbi = {};
     INPROC_MEMORY_RANGE64* ranges = FullMemoryRanges();
     const ULONG32 capacity = FullMemoryRangesCapacity();
 
     g_FullMemoryRangeCount = 0;
-    GetNativeSystemInfo(&sys);
-    BYTE* address = static_cast<BYTE*>(sys.lpMinimumApplicationAddress);
-    BYTE* maximum = static_cast<BYTE*>(sys.lpMaximumApplicationAddress);
+    g_FullMemoryBytes = 0;
+    BYTE* address = MinimumApplicationAddress();
+    BYTE* maximum = MaximumApplicationAddress();
 
-    while (address < maximum && g_FullMemoryRangeCount < capacity) {
+    while (address < maximum) {
         SIZE_T queried = VirtualQuery(address, &mbi, sizeof(mbi));
         if (queried == 0 || mbi.RegionSize == 0) {
             break;
         }
 
         if (mbi.State == MEM_COMMIT && IsDumpableProtect(mbi.Protect)) {
+            if (g_FullMemoryRangeCount >= capacity) {
+                SetLastError(ERROR_INSUFFICIENT_BUFFER);
+                return FALSE;
+            }
             ranges[g_FullMemoryRangeCount].Start = reinterpret_cast<ULONG64>(mbi.BaseAddress);
             ranges[g_FullMemoryRangeCount].Size = static_cast<ULONG64>(mbi.RegionSize);
+            g_FullMemoryBytes += static_cast<ULONG64>(mbi.RegionSize);
             ++g_FullMemoryRangeCount;
         }
 
@@ -36,22 +40,22 @@ void CaptureFullMemoryRanges() noexcept
         }
         address = next;
     }
+    return TRUE;
 }
+
 
 
 // Counts VirtualQuery regions for MiniDumpWithFullMemoryInfo.
 
 BOOL CountMemoryInfoRanges(ULONG64* rangeCount) noexcept
 {
-    SYSTEM_INFO sys = {};
     BYTE* address = nullptr;
     BYTE* maximum = nullptr;
     MEMORY_BASIC_INFORMATION mbi = {};
     ULONG64 count = 0;
 
-    GetNativeSystemInfo(&sys);
-    address = static_cast<BYTE*>(sys.lpMinimumApplicationAddress);
-    maximum = static_cast<BYTE*>(sys.lpMaximumApplicationAddress);
+    address = MinimumApplicationAddress();
+    maximum = MaximumApplicationAddress();
 
     while (address < maximum) {
         SIZE_T queried = VirtualQuery(address, &mbi, sizeof(mbi));
@@ -77,7 +81,6 @@ BOOL CountMemoryInfoRanges(ULONG64* rangeCount) noexcept
 
 BOOL WriteMemoryInfoList(HANDLE hFile, ULONG64 rangeCount) noexcept
 {
-    SYSTEM_INFO sys = {};
     BYTE* address = nullptr;
     BYTE* maximum = nullptr;
     MEMORY_BASIC_INFORMATION mbi = {};
@@ -92,9 +95,8 @@ BOOL WriteMemoryInfoList(HANDLE hFile, ULONG64 rangeCount) noexcept
         return FALSE;
     }
 
-    GetNativeSystemInfo(&sys);
-    address = static_cast<BYTE*>(sys.lpMinimumApplicationAddress);
-    maximum = static_cast<BYTE*>(sys.lpMaximumApplicationAddress);
+    address = MinimumApplicationAddress();
+    maximum = MaximumApplicationAddress();
 
     while (address < maximum && writtenCount < rangeCount) {
         SIZE_T queried = VirtualQuery(address, &mbi, sizeof(mbi));
@@ -410,8 +412,11 @@ void CollectKnownSelectedMemoryRanges(ULONG32 threadCount, BOOL includeDataSegs)
     ResetKnownMemoryRanges();
 
     for (ULONG32 i = 0; i < threadCount && i < g_ThreadPlanCount; ++i) {
-        if (g_ThreadPlan[i].StackSize != 0) {
+        if (g_ThreadPlan[i].IncludeStack && g_ThreadPlan[i].StackSize != 0) {
             AddKnownMemoryRange(g_ThreadPlan[i].StackStart, g_ThreadPlan[i].StackSize);
+        }
+        if (g_ThreadPlan[i].AuxStackSize != 0) {
+            AddKnownMemoryRange(g_ThreadPlan[i].AuxStackStart, g_ThreadPlan[i].AuxStackSize);
         }
     }
 
@@ -419,11 +424,9 @@ void CollectKnownSelectedMemoryRanges(ULONG32 threadCount, BOOL includeDataSegs)
         return;
     }
 
-    SYSTEM_INFO sys = {};
     MEMORY_BASIC_INFORMATION mbi = {};
-    GetNativeSystemInfo(&sys);
-    BYTE* address = static_cast<BYTE*>(sys.lpMinimumApplicationAddress);
-    BYTE* maximum = static_cast<BYTE*>(sys.lpMaximumApplicationAddress);
+    BYTE* address = MinimumApplicationAddress();
+    BYTE* maximum = MaximumApplicationAddress();
     while (address < maximum && g_KnownMemoryRangeCount < kMaxKnownMemoryRanges) {
         SIZE_T queried = VirtualQuery(address, &mbi, sizeof(mbi));
         if (queried == 0 || mbi.RegionSize == 0) {
@@ -462,8 +465,11 @@ BOOL CollectIndirectMemoryRanges(ULONG32 threadCount,
 
     // Phase 1: the faulting thread's stack (layer 1) and its full transitive subtree.
     for (ULONG32 i = 0; i < g_ThreadPlanCount; ++i) {
-        if (g_ThreadPlan[i].ThreadId == preferredThreadId && g_ThreadPlan[i].StackSize != 0) {
+        if (g_ThreadPlan[i].ThreadId == preferredThreadId && g_ThreadPlan[i].IncludeStack && g_ThreadPlan[i].StackSize != 0) {
             (void)ScanStackForIndirectMemory(g_ThreadPlan[i].StackStart, g_ThreadPlan[i].StackSize, preferredContext);
+            if (g_ThreadPlan[i].AuxStackSize != 0 && g_IndirectMemoryRangeCount < g_IndirectMemoryRangeCap) {
+                (void)ScanStackForIndirectMemory(g_ThreadPlan[i].AuxStackStart, g_ThreadPlan[i].AuxStackSize, nullptr);
+            }
             break;
         }
     }
@@ -471,10 +477,13 @@ BOOL CollectIndirectMemoryRanges(ULONG32 threadCount,
 
     // Phase 2: remaining threads' stacks (layer 1), then expand their subtrees.
     for (ULONG32 i = 0; i < g_ThreadPlanCount && g_IndirectMemoryRangeCount < g_IndirectMemoryRangeCap; ++i) {
-        if (g_ThreadPlan[i].ThreadId == preferredThreadId || g_ThreadPlan[i].StackSize == 0) {
+        if (g_ThreadPlan[i].ThreadId == preferredThreadId || !g_ThreadPlan[i].IncludeStack || g_ThreadPlan[i].StackSize == 0) {
             continue;
         }
         (void)ScanStackForIndirectMemory(g_ThreadPlan[i].StackStart, g_ThreadPlan[i].StackSize, nullptr);
+        if (g_ThreadPlan[i].AuxStackSize != 0 && g_IndirectMemoryRangeCount < g_IndirectMemoryRangeCap) {
+            (void)ScanStackForIndirectMemory(g_ThreadPlan[i].AuxStackStart, g_ThreadPlan[i].AuxStackSize, nullptr);
+        }
     }
     (void)ExpandIndirectBfs(bfsHead);
 
@@ -490,16 +499,14 @@ BOOL CountExtraMemoryRanges(BOOL includeDataSegs,
                             ULONG64* rangeCount,
                             ULONG64* bytesCount) noexcept
 {
-    SYSTEM_INFO sys = {};
     BYTE* address = nullptr;
     BYTE* maximum = nullptr;
     MEMORY_BASIC_INFORMATION mbi = {};
     ULONG64 count = 0;
     ULONG64 bytes = 0;
 
-    GetNativeSystemInfo(&sys);
-    address = static_cast<BYTE*>(sys.lpMinimumApplicationAddress);
-    maximum = static_cast<BYTE*>(sys.lpMaximumApplicationAddress);
+    address = MinimumApplicationAddress();
+    maximum = MaximumApplicationAddress();
 
     while (address < maximum) {
         SIZE_T queried = VirtualQuery(address, &mbi, sizeof(mbi));
@@ -532,15 +539,9 @@ BOOL CountExtraMemoryRanges(BOOL includeDataSegs,
 
 BOOL WriteRegionBytes(HANDLE hFile, BYTE* base, SIZE_T size) noexcept
 {
-    SYSTEM_INFO sys = {};
-    DWORD pageSize = 4096;
+    DWORD pageSize = NativePageSize();
     BYTE* cursor = base;
     SIZE_T remaining = size;
-
-    GetNativeSystemInfo(&sys);
-    if (sys.dwPageSize != 0) {
-        pageSize = sys.dwPageSize;
-    }
 
     while (remaining != 0) {
         SIZE_T chunk = remaining > pageSize ? pageSize : remaining;
@@ -586,25 +587,31 @@ BOOL WriteSelectedMemoryDescriptors(HANDLE hFile,
     // Stacks come straight from the frozen plan so the descriptor size and the byte stream
     // emitted in WriteSelectedMemoryBytes are guaranteed identical and in the same order.
     for (ULONG32 i = 0; i < threadCount && i < g_ThreadPlanCount; ++i) {
-        if (g_ThreadPlan[i].StackSize == 0) {
-            continue;
+        if (g_ThreadPlan[i].IncludeStack && g_ThreadPlan[i].StackSize != 0) {
+            descriptor.StartOfMemoryRange = g_ThreadPlan[i].StackStart;
+            descriptor.Memory.Rva = static_cast<RVA>(currentRva);
+            descriptor.Memory.DataSize = g_ThreadPlan[i].StackSize;
+            if (!WriteAll(hFile, &descriptor, sizeof(descriptor))) {
+                return FALSE;
+            }
+            currentRva += g_ThreadPlan[i].StackSize;
         }
-        descriptor.StartOfMemoryRange = g_ThreadPlan[i].StackStart;
-        descriptor.Memory.Rva = static_cast<RVA>(currentRva);
-        descriptor.Memory.DataSize = g_ThreadPlan[i].StackSize;
-        if (!WriteAll(hFile, &descriptor, sizeof(descriptor))) {
-            return FALSE;
+        if (g_ThreadPlan[i].AuxStackSize != 0) {
+            descriptor.StartOfMemoryRange = g_ThreadPlan[i].AuxStackStart;
+            descriptor.Memory.Rva = static_cast<RVA>(currentRva);
+            descriptor.Memory.DataSize = g_ThreadPlan[i].AuxStackSize;
+            if (!WriteAll(hFile, &descriptor, sizeof(descriptor))) {
+                return FALSE;
+            }
+            currentRva += g_ThreadPlan[i].AuxStackSize;
         }
-        currentRva += g_ThreadPlan[i].StackSize;
     }
 
-    SYSTEM_INFO sys = {};
     BYTE* address = nullptr;
     BYTE* maximum = nullptr;
     MEMORY_BASIC_INFORMATION mbi = {};
-    GetNativeSystemInfo(&sys);
-    address = static_cast<BYTE*>(sys.lpMinimumApplicationAddress);
-    maximum = static_cast<BYTE*>(sys.lpMaximumApplicationAddress);
+    address = MinimumApplicationAddress();
+    maximum = MaximumApplicationAddress();
     while (address < maximum) {
         SIZE_T queried = VirtualQuery(address, &mbi, sizeof(mbi));
         if (queried == 0 || mbi.RegionSize == 0) {
@@ -653,24 +660,29 @@ BOOL WriteSelectedMemoryBytes(HANDLE hFile,
     // written at its exact captured size (zero-filling unreadable pages) so descriptor.DataSize
     // always matches the bytes on disk.
     for (ULONG32 i = 0; i < threadCount && i < g_ThreadPlanCount; ++i) {
-        if (g_ThreadPlan[i].StackSize == 0) {
-            continue;
+        if (g_ThreadPlan[i].IncludeStack && g_ThreadPlan[i].StackSize != 0) {
+            if (!WriteRegionBytes(
+                    hFile,
+                    reinterpret_cast<BYTE*>(static_cast<ULONG_PTR>(g_ThreadPlan[i].StackStart)),
+                    g_ThreadPlan[i].StackSize)) {
+                return FALSE;
+            }
         }
-        if (!WriteRegionBytes(
-                hFile,
-                reinterpret_cast<BYTE*>(static_cast<ULONG_PTR>(g_ThreadPlan[i].StackStart)),
-                g_ThreadPlan[i].StackSize)) {
-            return FALSE;
+        if (g_ThreadPlan[i].AuxStackSize != 0) {
+            if (!WriteRegionBytes(
+                    hFile,
+                    reinterpret_cast<BYTE*>(static_cast<ULONG_PTR>(g_ThreadPlan[i].AuxStackStart)),
+                    g_ThreadPlan[i].AuxStackSize)) {
+                return FALSE;
+            }
         }
     }
 
-    SYSTEM_INFO sys = {};
     BYTE* address = nullptr;
     BYTE* maximum = nullptr;
     MEMORY_BASIC_INFORMATION mbi = {};
-    GetNativeSystemInfo(&sys);
-    address = static_cast<BYTE*>(sys.lpMinimumApplicationAddress);
-    maximum = static_cast<BYTE*>(sys.lpMaximumApplicationAddress);
+    address = MinimumApplicationAddress();
+    maximum = MaximumApplicationAddress();
     while (address < maximum) {
         SIZE_T queried = VirtualQuery(address, &mbi, sizeof(mbi));
         if (queried == 0 || mbi.RegionSize == 0) {
@@ -733,11 +745,7 @@ BOOL WriteMemoryDescriptors(HANDLE hFile, ULONG64 rangeCount, ULONG64 memoryBase
 
 BOOL WriteMemoryBytes(HANDLE hFile, ULONG64 rangeCount) noexcept
 {
-    SYSTEM_INFO sys = {};
-    DWORD pageSize = 0;
-
-    GetNativeSystemInfo(&sys);
-    pageSize = sys.dwPageSize != 0 ? sys.dwPageSize : 4096;
+    DWORD pageSize = NativePageSize();
 
     const INPROC_MEMORY_RANGE64* fullRanges = FullMemoryRanges();
     for (ULONG32 i = 0; i < g_FullMemoryRangeCount && i < rangeCount; ++i) {

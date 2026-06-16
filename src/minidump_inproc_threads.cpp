@@ -19,10 +19,10 @@ BOOL CaptureExceptionStreamInfo(
     if (exceptionParam == nullptr) {
         return FALSE;
     }
-    if (!SafeCopyBytes(&pointers, &exceptionParam->ExceptionPointers, sizeof(pointers)) || pointers == nullptr) {
+    if (!SafeCopyBytes(&pointers, &exceptionParam->ExceptionPointers, sizeof(PVOID)) || pointers == nullptr) {
         return FALSE;
     }
-    if (!SafeCopyBytes(&context, &pointers->ContextRecord, sizeof(context)) || context == nullptr) {
+    if (!SafeCopyBytes(&context, &pointers->ContextRecord, sizeof(PVOID)) || context == nullptr) {
         return FALSE;
     }
     if (!SafeCopyBytes(&record, pointers->ExceptionRecord, sizeof(record))) {
@@ -363,8 +363,14 @@ BOOL BuildThreadPlanAndFreeze(DWORD preferredThreadId) noexcept
             if (base > limit && (base - limit) <= 0xffffffffULL) {
                 entry.StackStart = limit;
                 entry.StackSize = static_cast<ULONG32>(base - limit);
+                entry.OriginalStackStart = entry.StackStart;
+                entry.OriginalStackSize = entry.StackSize;
             }
         }
+        entry.IncludeStack = FALSE;
+        entry.AuxStackStart = 0;
+        entry.AuxStackSize = 0;
+
 
         if (entry.ThreadId == preferredThreadId) {
             g_ExceptionThreadIndex = i;
@@ -497,7 +503,8 @@ BOOL WriteThreadList(HANDLE hFile,
         thread.ThreadContext.Rva = contextBaseRva + i * sizeof(CONTEXT);
         thread.ThreadContext.DataSize = sizeof(CONTEXT);
 
-        if (entry.StackSize != 0) {
+        const BOOL describeStack = stacksInMemoryList ? entry.IncludeStack : (entry.StackSize != 0);
+        if (describeStack && entry.StackSize != 0) {
             thread.Stack.StartOfMemoryRange = entry.StackStart;
             thread.Stack.Memory.DataSize = entry.StackSize;
             if (stacksInMemoryList) {
@@ -505,6 +512,10 @@ BOOL WriteThreadList(HANDLE hFile,
                 stackRva += entry.StackSize;
             }
         }
+        if (stacksInMemoryList && entry.AuxStackSize != 0) {
+            stackRva += entry.AuxStackSize;
+        }
+
 
         if (!WriteAll(hFile, &thread, sizeof(thread))) {
             return FALSE;
@@ -632,6 +643,280 @@ BOOL QueryThreadStackRange(DWORD threadId, ULONG64* stackStart, ULONG32* stackSi
 }
 
 
+namespace {
+
+
+
+DWORD FindMainThreadId() noexcept
+{
+    DWORD bestThreadId = g_ThreadPlanCount != 0 ? g_ThreadPlan[0].ThreadId : 0;
+    ULONG64 bestCreateTime = 0;
+    for (ULONG32 i = 0; i < g_ThreadPlanCount; ++i) {
+        const INPROC_THREAD_PLAN_ENTRY& entry = g_ThreadPlan[i];
+        if (entry.CreateTime == 0) {
+            continue;
+        }
+        if (bestCreateTime == 0 || entry.CreateTime < bestCreateTime) {
+            bestCreateTime = entry.CreateTime;
+            bestThreadId = entry.ThreadId;
+        }
+    }
+    return bestThreadId;
+}
+
+ULONG64 CapturePlanStackPointer(const INPROC_THREAD_PLAN_ENTRY& entry,
+                                DWORD preferredThreadId,
+                                const CONTEXT* exceptionContext) noexcept
+{
+    if (entry.ThreadId == preferredThreadId) {
+        ULONG64 sp = ContextStackPointer(exceptionContext);
+        if (sp != 0) {
+            return sp;
+        }
+    }
+
+    CONTEXT context = {};
+    if (entry.IsCurrent) {
+        RtlCaptureContext(&context);
+        return ContextStackPointer(&context);
+    }
+    if (entry.Handle != nullptr && entry.Suspended) {
+        context.ContextFlags = CONTEXT_ALL;
+        if (GetThreadContext(entry.Handle, &context)) {
+            return ContextStackPointer(&context);
+        }
+    }
+    return 0;
+}
+
+void ClipStackWindow(INPROC_THREAD_PLAN_ENTRY& entry, ULONG64 preferredSp, ULONG32 capBytes) noexcept
+{
+    const ULONG64 stackStart = entry.OriginalStackStart != 0 ? entry.OriginalStackStart : entry.StackStart;
+    const ULONG32 stackSize = entry.OriginalStackSize != 0 ? entry.OriginalStackSize : entry.StackSize;
+    if (stackStart == 0 || stackSize == 0) {
+        entry.StackStart = 0;
+        entry.StackSize = 0;
+        return;
+    }
+
+    const ULONG64 stackEnd = stackStart + stackSize;
+    ULONG64 captureStart = 0;
+    if (preferredSp >= stackStart && preferredSp < stackEnd) {
+        captureStart = AlignDown(preferredSp, kIndirectMemoryRangeSize);
+        if (captureStart < stackStart) {
+            captureStart = stackStart;
+        }
+    } else if (stackSize > capBytes) {
+        captureStart = stackEnd - capBytes;
+        captureStart = AlignDown(captureStart, kIndirectMemoryRangeSize);
+        if (captureStart < stackStart) {
+            captureStart = stackStart;
+        }
+    } else {
+        captureStart = stackStart;
+    }
+
+    ULONG64 captureEnd = stackEnd;
+    if (captureEnd > captureStart + capBytes) {
+        captureEnd = captureStart + capBytes;
+    }
+    if (captureEnd <= captureStart) {
+        entry.StackStart = 0;
+        entry.StackSize = 0;
+        return;
+    }
+    entry.StackStart = captureStart;
+    entry.StackSize = static_cast<ULONG32>(captureEnd - captureStart);
+}
+
+void RestoreFullStackWindow(INPROC_THREAD_PLAN_ENTRY& entry) noexcept
+{
+    const ULONG64 stackStart = entry.OriginalStackStart != 0 ? entry.OriginalStackStart : entry.StackStart;
+    const ULONG32 stackSize = entry.OriginalStackSize != 0 ? entry.OriginalStackSize : entry.StackSize;
+    entry.StackStart = stackStart;
+    entry.StackSize = stackSize;
+    entry.AuxStackStart = 0;
+    entry.AuxStackSize = 0;
+}
+
+void AddStackOverflowHighWindow(INPROC_THREAD_PLAN_ENTRY& entry) noexcept
+{
+    const ULONG64 stackStart = entry.OriginalStackStart != 0 ? entry.OriginalStackStart : entry.StackStart;
+    const ULONG32 stackSize = entry.OriginalStackSize != 0 ? entry.OriginalStackSize : entry.StackSize;
+    if (stackStart == 0 || stackSize == 0) {
+        return;
+    }
+
+    const ULONG64 stackEnd = stackStart + stackSize;
+    ULONG64 highStart = stackSize > kStackOverflowHighStackBytes
+        ? stackEnd - kStackOverflowHighStackBytes
+        : stackStart;
+    highStart = AlignDown(highStart, kIndirectMemoryRangeSize);
+    if (highStart < stackStart) {
+        highStart = stackStart;
+    }
+
+    if (entry.StackSize != 0 && RangesOverlap(highStart, stackEnd - highStart, entry.StackStart, entry.StackSize)) {
+        return;
+    }
+
+    entry.AuxStackStart = highStart;
+    entry.AuxStackSize = static_cast<ULONG32>(stackEnd - highStart);
+}
+
+
+
+BOOL TryIncludeStackRange(ULONG64* remaining, ULONG32* size, ULONG64* start, BOOL trimFromHighEnd) noexcept
+{
+    if (*size == 0) {
+        return FALSE;
+    }
+    const ULONG64 descriptorCost = sizeof(MINIDUMP_MEMORY_DESCRIPTOR);
+    ULONG64 cost = descriptorCost + *size;
+    if (cost <= *remaining) {
+        *remaining -= cost;
+        return TRUE;
+    }
+    if (*remaining <= descriptorCost + kIndirectMemoryRangeSize) {
+        *size = 0;
+        return FALSE;
+    }
+
+    ULONG64 newSize = (*remaining - descriptorCost) & ~(static_cast<ULONG64>(kIndirectMemoryRangeSize) - 1ULL);
+    if (newSize == 0 || newSize > 0xffffffffULL) {
+        *size = 0;
+        return FALSE;
+    }
+    if (trimFromHighEnd) {
+        ULONG64 end = *start + *size;
+        *start = end - newSize;
+    }
+    *size = static_cast<ULONG32>(newSize);
+    *remaining = 0;
+    return TRUE;
+}
+
+void IncludePrimaryStack(ULONG32 index, ULONG64* remaining, BOOL allowTrim) noexcept
+{
+    if (index >= g_ThreadPlanCount || g_ThreadPlan[index].IncludeStack) {
+        return;
+    }
+    INPROC_THREAD_PLAN_ENTRY& entry = g_ThreadPlan[index];
+    ULONG32 size = entry.StackSize;
+    ULONG64 start = entry.StackStart;
+    BOOL included = allowTrim
+        ? TryIncludeStackRange(remaining, &size, &start, FALSE)
+        : (size != 0 && sizeof(MINIDUMP_MEMORY_DESCRIPTOR) + static_cast<ULONG64>(size) <= *remaining);
+    if (!allowTrim && included) {
+        *remaining -= sizeof(MINIDUMP_MEMORY_DESCRIPTOR) + static_cast<ULONG64>(size);
+    }
+    if (included) {
+        entry.StackStart = start;
+        entry.StackSize = size;
+        entry.IncludeStack = TRUE;
+    } else if (!allowTrim) {
+        entry.IncludeStack = FALSE;
+    }
+}
+
+void IncludeAuxStack(ULONG32 index, ULONG64* remaining, BOOL allowTrim) noexcept
+{
+    if (index >= g_ThreadPlanCount) {
+        return;
+    }
+    INPROC_THREAD_PLAN_ENTRY& entry = g_ThreadPlan[index];
+    ULONG32 size = entry.AuxStackSize;
+    ULONG64 start = entry.AuxStackStart;
+    BOOL included = allowTrim
+        ? TryIncludeStackRange(remaining, &size, &start, TRUE)
+        : (size != 0 && sizeof(MINIDUMP_MEMORY_DESCRIPTOR) + static_cast<ULONG64>(size) <= *remaining);
+    if (!allowTrim && included) {
+        *remaining -= sizeof(MINIDUMP_MEMORY_DESCRIPTOR) + static_cast<ULONG64>(size);
+    }
+    if (included) {
+        entry.AuxStackStart = start;
+        entry.AuxStackSize = size;
+    } else {
+        entry.AuxStackStart = 0;
+        entry.AuxStackSize = 0;
+    }
+}
+
+} // namespace
+
+
+BOOL ApplyThreadStackCapturePolicy(DWORD preferredThreadId,
+                                   ULONG32 exceptionCode,
+                                   const CONTEXT* exceptionContext,
+                                   ULONG64 fixedDumpBytes,
+                                   ULONG64 hardMaxFileSize) noexcept
+{
+    if (hardMaxFileSize <= fixedDumpBytes + sizeof(ULONG32)) {
+        SetLastError(ERROR_FILE_TOO_LARGE);
+        return FALSE;
+    }
+
+    const BOOL stackOverflow = exceptionCode == STATUS_STACK_OVERFLOW;
+    const DWORD mainThreadId = FindMainThreadId();
+    ULONG32 exceptionIndex = 0xffffffffUL;
+    ULONG32 mainIndex = 0xffffffffUL;
+
+    for (ULONG32 i = 0; i < g_ThreadPlanCount; ++i) {
+        INPROC_THREAD_PLAN_ENTRY& entry = g_ThreadPlan[i];
+        entry.IncludeStack = FALSE;
+        entry.AuxStackStart = 0;
+        entry.AuxStackSize = 0;
+        if (entry.OriginalStackStart == 0 || entry.OriginalStackSize == 0) {
+            entry.OriginalStackStart = entry.StackStart;
+            entry.OriginalStackSize = entry.StackSize;
+        }
+
+        const BOOL isStackOverflowThread = stackOverflow && entry.ThreadId == preferredThreadId;
+        if (isStackOverflowThread && entry.OriginalStackSize <= kStackOverflowFullStackThreshold) {
+            RestoreFullStackWindow(entry);
+        } else {
+            ULONG64 sp = CapturePlanStackPointer(entry, preferredThreadId, exceptionContext);
+            ULONG32 cap = isStackOverflowThread
+                ? kStackOverflowLiveStackBytes
+                : kMaxCapturedStackBytes;
+            ClipStackWindow(entry, sp, cap);
+            if (isStackOverflowThread) {
+                AddStackOverflowHighWindow(entry);
+            }
+        }
+        if (entry.ThreadId == preferredThreadId) {
+            exceptionIndex = i;
+        }
+        if (entry.ThreadId == mainThreadId) {
+            mainIndex = i;
+        }
+    }
+
+    ULONG64 remaining = hardMaxFileSize - fixedDumpBytes - sizeof(ULONG32);
+    if (exceptionIndex != 0xffffffffUL) {
+        const BOOL requireFullStackOverflowStack = stackOverflow &&
+            g_ThreadPlan[exceptionIndex].OriginalStackSize != 0 &&
+            g_ThreadPlan[exceptionIndex].OriginalStackSize <= kStackOverflowFullStackThreshold;
+        IncludePrimaryStack(exceptionIndex, &remaining, !requireFullStackOverflowStack);
+        if (requireFullStackOverflowStack && !g_ThreadPlan[exceptionIndex].IncludeStack) {
+            SetLastError(ERROR_FILE_TOO_LARGE);
+            return FALSE;
+        }
+        IncludeAuxStack(exceptionIndex, &remaining, TRUE);
+    }
+    if (mainIndex != 0xffffffffUL && mainIndex != exceptionIndex) {
+        IncludePrimaryStack(mainIndex, &remaining, TRUE);
+    }
+    for (ULONG32 i = 0; i < g_ThreadPlanCount && remaining > sizeof(MINIDUMP_MEMORY_DESCRIPTOR); ++i) {
+        if (i == exceptionIndex || i == mainIndex) {
+            continue;
+        }
+        IncludePrimaryStack(i, &remaining, FALSE);
+    }
+    return TRUE;
+}
+
+
 // Counts stack ranges that will be included in the selected MemoryList stream.
 
 BOOL CountStackMemoryRanges(ULONG32 threadCount, ULONG64* rangeCount, ULONG64* bytesCount) noexcept
@@ -640,9 +925,13 @@ BOOL CountStackMemoryRanges(ULONG32 threadCount, ULONG64* rangeCount, ULONG64* b
     ULONG64 bytes = 0;
 
     for (ULONG32 i = 0; i < threadCount && i < g_ThreadPlanCount; ++i) {
-        if (g_ThreadPlan[i].StackSize != 0) {
+        if (g_ThreadPlan[i].IncludeStack && g_ThreadPlan[i].StackSize != 0) {
             ++count;
             bytes += g_ThreadPlan[i].StackSize;
+        }
+        if (g_ThreadPlan[i].AuxStackSize != 0) {
+            ++count;
+            bytes += g_ThreadPlan[i].AuxStackSize;
         }
     }
 
@@ -653,6 +942,7 @@ BOOL CountStackMemoryRanges(ULONG32 threadCount, ULONG64* rangeCount, ULONG64* b
 
 
 // Extracts RSP/ESP from a CONTEXT for prioritizing indirect-memory scans near the crash frame.
+
 
 ULONG64 ContextStackPointer(const CONTEXT* context) noexcept
 {
@@ -669,7 +959,11 @@ ULONG64 ContextStackPointer(const CONTEXT* context) noexcept
 }
 
 
+
+
+
 // Returns the best stack range for a thread, preferring the live TEB for the current thread to avoid stale snapshot limits.
+
 
 BOOL QuerySnapshotOrThreadStackRange(const INPROC_THREAD_SNAPSHOT& snapshot,
                                      ULONG32 index,

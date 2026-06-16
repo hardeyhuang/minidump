@@ -22,6 +22,9 @@
 #ifndef NT_SUCCESS
 #define NT_SUCCESS(Status) (((LONG)(Status)) >= 0)
 #endif
+#ifndef STATUS_STACK_OVERFLOW
+#define STATUS_STACK_OVERFLOW ((DWORD)0xC00000FD)
+#endif
 
 namespace minidump_inproc::internal {
 
@@ -43,12 +46,32 @@ inline constexpr ULONG64 kFileTimeUnixEpoch = 116444736000000000ULL;
 inline constexpr ULONG64 kFileTimeTicksPerSecond = 10000000ULL;
 inline constexpr ULONG kSystemProcessInformation = 5;
 inline constexpr ULONG kSystemExtendedProcessInformation = 57;
+// NtQueryInformationProcess class for VM_COUNTERS_EX (working set / private commit / pagefile usage).
+inline constexpr ULONG kProcessVmCounters = 3;
+// NtQueryInformationProcess class for the open-handle count (+ high watermark / peak).
+inline constexpr ULONG kProcessHandleCount = 20;
+// ANSI comment-stream buffer: system + process memory summary text shown by WinDbg on load.
+inline constexpr ULONG32 kCommentBufferBytes = 1024;
 
 // One shared scratch buffer is reused across non-overlapping phases to keep the static
 // footprint small: first as the NtQuerySystemInformation process snapshot (consumed entirely
 // while building the thread plan), then as the full-memory range plan (full-memory dumps) or
 // the indirect-memory range plan (selected-memory dumps). These uses never overlap in time.
 inline constexpr ULONG kScratchBufferSize = 4 * 1024 * 1024;
+
+// Production size policy: MaxFileSize is a hard cap. Values below 4 MB (including 0)
+// are clamped to 4 MB.
+inline constexpr ULONG64 kMinHardMaxFileSize = 4ULL * 1024 * 1024;
+inline constexpr ULONG32 kMaxCapturedStackBytes = 1024 * 1024;
+// STATUS_STACK_OVERFLOW stack capture policy:
+//   - If the crashing thread's original stack is <= kStackOverflowFullStackThreshold (1 MB), the
+//     whole stack is recorded as-is.
+//   - Otherwise a deterministic two-window capture is used: kStackOverflowLiveStackBytes (512 KB) of
+//     the live unwind window from SP/RSP, plus kStackOverflowHighStackBytes (512 KB) near StackBase
+//     so the recursion entry / call origin is still observable.
+inline constexpr ULONG32 kStackOverflowFullStackThreshold = 1 * 1024 * 1024;
+inline constexpr ULONG32 kStackOverflowLiveStackBytes = 512 * 1024;
+inline constexpr ULONG32 kStackOverflowHighStackBytes = 512 * 1024;
 
 
 struct INPROC_UNICODE_STRING {
@@ -179,6 +202,30 @@ struct INPROC_THREAD_SNAPSHOT {
     BOOL Extended;
 };
 
+// Subset of VM_COUNTERS_EX returned by NtQueryInformationProcess(ProcessVmCounters). PrivateUsage
+// is the process private commit charge; PagefileUsage is the classic commit-charge counter.
+struct INPROC_VM_COUNTERS_EX {
+    SIZE_T PeakVirtualSize;
+    SIZE_T VirtualSize;
+    ULONG PageFaultCount;
+    SIZE_T PeakWorkingSetSize;
+    SIZE_T WorkingSetSize;
+    SIZE_T QuotaPeakPagedPoolUsage;
+    SIZE_T QuotaPagedPoolUsage;
+    SIZE_T QuotaPeakNonPagedPoolUsage;
+    SIZE_T QuotaNonPagedPoolUsage;
+    SIZE_T PagefileUsage;
+    SIZE_T PeakPagefileUsage;
+    SIZE_T PrivateUsage;
+};
+
+// Returned by NtQueryInformationProcess(ProcessHandleCount). The high watermark is the peak number
+// of open handles the process has held, which is the key signal for handle-leak diagnosis.
+struct INPROC_PROCESS_HANDLE_INFORMATION {
+    ULONG HandleCount;
+    ULONG HandleCountHighWatermark;
+};
+
 struct INPROC_MEMORY_RANGE {
     ULONG64 Start;
     ULONG32 Size;
@@ -192,6 +239,16 @@ struct INPROC_MEMORY_RANGE64 {
     ULONG64 Size;
 };
 
+enum INPROC_STREAM_WRITE_RESULT {
+    InprocStreamOk,
+    InprocStreamSkip,
+    InprocStreamIoFailed,
+};
+
+inline INPROC_STREAM_WRITE_RESULT StreamResultFromBool(BOOL ok) noexcept {
+    return ok ? InprocStreamOk : InprocStreamIoFailed;
+}
+
 // One immutable per-thread record captured under freeze. Every later stream (ThreadList,
 // thread contexts, ThreadInfoList, stack MemoryList ranges, indirect-memory scan) reads
 // this plan instead of re-querying the live system, which keeps all passes consistent.
@@ -201,8 +258,13 @@ struct INPROC_THREAD_PLAN_ENTRY {
     BOOL Suspended;       // TRUE if SuspendThread succeeded on Handle
     BOOL IsCurrent;       // TRUE for the dump-writing thread
     PVOID Teb;
-    ULONG64 StackStart;   // == TIB StackLimit
-    ULONG32 StackSize;    // == StackBase - StackLimit
+    ULONG64 StackStart;   // captured primary stack window start
+    ULONG32 StackSize;    // captured primary stack window size
+    ULONG64 OriginalStackStart; // original TIB StackLimit before production clipping
+    ULONG32 OriginalStackSize;  // original StackBase - StackLimit before production clipping
+    BOOL IncludeStack;          // TRUE if the primary stack window fits the hard dump budget
+    ULONG64 AuxStackStart;      // optional extra window, used for large stack-overflow high-address stack top
+    ULONG32 AuxStackSize;
     ULONG64 CreateTime;
     ULONG64 KernelTime;
     ULONG64 UserTime;
@@ -230,17 +292,29 @@ struct RTL_OSVERSIONINFOEXW_INPROC {
 using RtlGetVersionFn = LONG (WINAPI*)(RTL_OSVERSIONINFOEXW_INPROC*);
 using NtQueryInformationThreadFn = LONG (WINAPI*)(HANDLE, ULONG, PVOID, ULONG, PULONG);
 using NtQuerySystemInformationFn = LONG (WINAPI*)(ULONG, PVOID, ULONG, PULONG);
+using NtQueryInformationProcessFn = LONG (WINAPI*)(HANDLE, ULONG, PVOID, ULONG, PULONG);
+// user32!GetGuiResources, used for GDI/USER object counts. Resolved at load time ONLY if user32 is
+// already mapped (we never LoadLibrary it), so the library never forces a user32 dependency.
+using GetGuiResourcesFn = DWORD (WINAPI*)(HANDLE, DWORD);
 
 struct INPROC_API_TABLE {
     RtlGetVersionFn RtlGetVersion;
     NtQueryInformationThreadFn NtQueryInformationThread;
     NtQuerySystemInformationFn NtQuerySystemInformation;
+    NtQueryInformationProcessFn NtQueryInformationProcess;
+    GetGuiResourcesFn GetGuiResources;   // may be null when user32 is not loaded
 };
 
 extern CONTEXT g_ContextScratch;
 
 extern volatile LONG g_ApisInitialized;
 extern INPROC_API_TABLE g_Apis;
+extern SYSTEM_INFO g_NativeSystemInfo;
+
+// ANSI comment-stream text (system + process memory summary) and its byte length, built once per
+// dump. Static so it persists from layout computation to the write pass; dumps are serialized.
+extern char g_CommentBuffer[kCommentBufferBytes];
+extern ULONG32 g_CommentBytes;
 extern ULONG32 g_IndirectMemoryRangeCount;
 extern INPROC_MEMORY_RANGE g_KnownMemoryRanges[kMaxKnownMemoryRanges];
 extern ULONG32 g_KnownMemoryRangeCount;
@@ -261,6 +335,7 @@ extern ULONG32 g_ExceptionThreadIndex;
 
 // Number of committed full-memory ranges captured in the scratch buffer.
 extern ULONG32 g_FullMemoryRangeCount;
+extern ULONG64 g_FullMemoryBytes;
 
 // Effective per-dump cap on indirect-memory ranges (derived from MaxFileSize and buffer capacity).
 extern ULONG32 g_IndirectMemoryRangeCap;
@@ -304,8 +379,16 @@ INPROC_PEB* GetCurrentPeb() noexcept;
 // Reads the TEB pointer directly from the architecture-specific segment register.
 PVOID GetCurrentTebPointer() noexcept;
 
-// Pre-resolves low-level NTDLL entry points during normal execution so the crash path does not call GetProcAddress lazily.
-BOOL ResolveInprocApis() noexcept;
+// Accesses process-invariant system information cached during load-time initialization.
+DWORD NativePageSize() noexcept;
+BYTE* MinimumApplicationAddress() noexcept;
+BYTE* MaximumApplicationAddress() noexcept;
+
+// Normalizes the caller's MaxFileSize into the production hard cap.
+ULONG64 NormalizeHardMaxFileSize(ULONG64 maxFileSize) noexcept;
+
+// Caches system information and pre-resolves low-level NTDLL entry points during load-time initialization.
+void ResolveInprocApis() noexcept;
 
 // Converts a FILETIME timestamp to the seconds-since-1970 format used by MINIDUMP_MISC_INFO.
 ULONG32 FileTimeToUnixSeconds(const FILETIME& ft) noexcept;
@@ -313,7 +396,7 @@ ULONG32 FileTimeToUnixSeconds(const FILETIME& ft) noexcept;
 // Converts a FILETIME duration to seconds for process user/kernel time fields.
 ULONG32 FileTimeDurationSeconds(const FILETIME& ft) noexcept;
 
-// Probes the first and last byte of a range under SEH so corrupt pointers do not tear down dump generation.
+// Probes every touched page of a range under SEH so corrupt middle pages do not tear down dump generation.
 BOOL SafeReadBytes(const void* address, SIZE_T size) noexcept;
 
 // Copies memory under SEH; this is used when reading potentially damaged process structures such as PEB/LDR or exception records.
@@ -406,7 +489,7 @@ void ResumeThreadPlan() noexcept;
 
 // Captures committed, dumpable regions for MiniDumpWithFullMemory into g_FullMemoryRanges in a single
 // VirtualQuery walk so the descriptor and byte passes can never disagree on count or size.
-void CaptureFullMemoryRanges() noexcept;
+BOOL CaptureFullMemoryRanges() noexcept;
 
 // Queries a non-current thread TEB through pre-resolved NtQueryInformationThread.
 PVOID QueryThreadTeb(HANDLE hThread, DWORD threadId) noexcept;
@@ -437,6 +520,13 @@ BOOL WriteThreadInfoList(HANDLE hFile, ULONG32 threadCount) noexcept;
 
 // Reads a thread stack range from its TEB, opening the thread only when it is not the current thread.
 BOOL QueryThreadStackRange(DWORD threadId, ULONG64* stackStart, ULONG32* stackSize) noexcept;
+
+// Applies production stack clipping and hard-budget priority: crash stack, main thread stack, then best-effort others.
+BOOL ApplyThreadStackCapturePolicy(DWORD preferredThreadId,
+                                   ULONG32 exceptionCode,
+                                   const CONTEXT* exceptionContext,
+                                   ULONG64 fixedDumpBytes,
+                                   ULONG64 hardMaxFileSize) noexcept;
 
 // Counts stack ranges that will be included in the selected MemoryList stream.
 BOOL CountStackMemoryRanges(ULONG32 threadCount, ULONG64* rangeCount, ULONG64* bytesCount) noexcept;
@@ -528,10 +618,19 @@ BOOL WriteSystemInfo(HANDLE hFile) noexcept;
 // Writes MiscInfoStream with process id and process timing information.
 BOOL WriteMiscInfo(HANDLE hFile) noexcept;
 
+// Builds the ANSI comment text (system + process memory summary) into g_CommentBuffer and returns
+// its 4-byte-aligned byte length (including NUL + padding). Always produces a valid, NUL-terminated
+// string even if the underlying queries fail. Safe to call before file layout.
+ULONG32 BuildMemoryCommentText() noexcept;
+
+// Writes CommentStreamA from g_CommentBuffer. byteLen must equal the value returned by
+// BuildMemoryCommentText (the size reserved in the stream directory).
+INPROC_STREAM_WRITE_RESULT WriteCommentStream(HANDLE hFile, ULONG32 byteLen) noexcept;
+
 
 
 // Writes ExceptionStream and points it at the already-laid-out exception thread context record.
-BOOL WriteExceptionStream(HANDLE hFile, ULONG32 contextRva, PMINIDUMP_EXCEPTION_INFORMATION exceptionParam) noexcept;
+INPROC_STREAM_WRITE_RESULT WriteExceptionStream(HANDLE hFile, ULONG32 contextRva, const MINIDUMP_EXCEPTION_STREAM* capturedException) noexcept;
 
 // Lays out the complete minidump file, computes stream RVAs, writes directories, and serializes each enabled stream.
 // maxFileSize is a soft size budget (0 = unlimited) applied to truncatable memory in priority order.
