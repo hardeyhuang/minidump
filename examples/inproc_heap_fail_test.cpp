@@ -360,7 +360,7 @@ BOOL RunScenario(const Scenario& scenario) noexcept
     InterlockedExchange(&g_FailMask, static_cast<LONG>(scenario.FailMask));
     InterlockedExchange(&g_HooksActive, 1);
     SetLastError(ERROR_SUCCESS);
-    BOOL writeOk = WriteMiniDumpInproc(file, scenario.DumpType, &exceptionInfo, 0);
+    BOOL writeOk = WriteMiniDumpInproc(file, scenario.DumpType, &exceptionInfo, nullptr, 0);
     DWORD writeError = writeOk ? ERROR_SUCCESS : GetLastError();
     InterlockedExchange(&g_HooksActive, 0);
     InterlockedExchange(&g_FailMask, 0);

@@ -15,8 +15,20 @@ BOOL WriteMiniDumpInprocImpl(
     HANDLE hFile,
     MINIDUMP_TYPE dumpType,
     PMINIDUMP_EXCEPTION_INFORMATION exceptionParam,
+    PMINIDUMP_USER_STREAM_INFORMATION userStreamParam,
     ULONG64 maxFileSize) noexcept
 {
+    // Start the total-elapsed stopwatch as early as possible so the duration patched into
+    // CommentStreamA covers nearly the entire dump. QueryPerformanceCounter reads the shared
+    // user-mode timer page: no heap, no syscall, no loader lock -- safe on the crash path.
+    LARGE_INTEGER perfStart = {};
+    QueryPerformanceCounter(&perfStart);
+
+    // Caller user streams that survive budget admission (in array order), and their total padded
+    // byte size. Admitted with higher priority than indirectly-referenced memory, subject to the cap.
+    ULONG32 includedUserStreamCount = 0;
+    ULONG64 userStreamBytes = 0;
+
     ULONG64 fullMemoryRangeCount = 0;
     ULONG64 stackRangeCount = 0, stackBytes = 0, extraRangeCount = 0, extraBytes = 0;
     ULONG64 indirectRangeCount = 0, indirectBytes = 0;
@@ -67,7 +79,9 @@ BOOL WriteMiniDumpInprocImpl(
     ULONG32 exceptionStreamSize = 0;
 
     MINIDUMP_HEADER header = {};
-    MINIDUMP_DIRECTORY directories[14] = {};
+    // Up to 9 built-in stream entries (6 always-present + Exception/ThreadInfo/MemoryInfo) plus one
+    // entry per admitted user stream.
+    MINIDUMP_DIRECTORY directories[9 + kMaxUserStreams] = {};
     LARGE_INTEGER pos = {};
 
     hasException = CaptureExceptionStreamInfo(exceptionParam, &exceptionProbe, &contextProbe);
@@ -81,6 +95,10 @@ BOOL WriteMiniDumpInprocImpl(
     // is fixed. The query is heap-free and SEH-guarded, and always yields a valid NUL-terminated
     // string, so the reserved directory size stays correct even if the queries fail.
     const ULONG32 commentStreamSize = BuildMemoryCommentText();
+
+    // Snapshot the caller's user streams once (validated under SEH) so layout and the write pass
+    // agree on which streams are present and their sizes. Admission against the budget happens below.
+    SnapshotUserStreams(userStreamParam);
 
     // Freeze every other thread and snapshot the process exactly once. All later passes read this
     // immutable plan, which is what keeps descriptor counts/sizes consistent with the byte streams.
@@ -131,6 +149,21 @@ BOOL WriteMiniDumpInprocImpl(
             return FALSE;
         }
         fullMemoryRangeCount = g_FullMemoryRangeCount;
+
+        // User streams: admit in array order against the hard cap, beyond the complete memory set.
+        // Each is all-or-nothing; once one would not fit, stop (keeps inclusion deterministic).
+        const ULONG64 fullListBytes = sizeof(ULONG64) + sizeof(ULONG64) +
+                                      fullMemoryRangeCount * sizeof(MINIDUMP_MEMORY_DESCRIPTOR64);
+        ULONG64 fullUsed = fixedSize + fullListBytes + g_FullMemoryBytes;
+        for (ULONG32 i = 0; i < g_UserStreamCount; ++i) {
+            const ULONG64 cost = sizeof(MINIDUMP_DIRECTORY) + Align4(g_UserStreams[i].BufferSize);
+            if (fullUsed + cost > hardMaxFileSize) {
+                break;
+            }
+            fullUsed += cost;
+            userStreamBytes += Align4(g_UserStreams[i].BufferSize);
+            ++includedUserStreamCount;
+        }
     } else {
         // The MemoryList stream addresses each region's bytes with a 32-bit RVA, so a selected-memory
         // dump must stay under 4 GB or those RVAs would silently truncate and corrupt the file. We
@@ -175,7 +208,20 @@ BOOL WriteMiniDumpInprocImpl(
             }
         }
 
-        // Priority 2 (lowest): indirectly-referenced memory, capped by whatever budget is left.
+        // Priority 2: caller user streams. Higher priority than indirectly-referenced memory; each
+        // is all-or-nothing against the remaining budget, included in array order until one would
+        // exceed the cap (then stop, so inclusion stays a deterministic prefix).
+        for (ULONG32 i = 0; i < g_UserStreamCount; ++i) {
+            const ULONG64 cost = sizeof(MINIDUMP_DIRECTORY) + Align4(g_UserStreams[i].BufferSize);
+            if (used + cost > effectiveBudget) {
+                break;
+            }
+            used += cost;
+            userStreamBytes += Align4(g_UserStreams[i].BufferSize);
+            ++includedUserStreamCount;
+        }
+
+        // Priority 3 (lowest): indirectly-referenced memory, capped by whatever budget is left.
         if (includeIndirectMemory) {
             ULONG32 cap = IndirectMemoryRangesCapacity();
             const ULONG64 perPage = sizeof(MINIDUMP_MEMORY_DESCRIPTOR) + kIndirectMemoryRangeSize;
@@ -195,11 +241,18 @@ BOOL WriteMiniDumpInprocImpl(
         selectedMemoryRangeCount = stackRangeCount + extraRangeCount + indirectRangeCount;
     }
 
+    // Every admitted user stream adds one directory entry; fold them into the total stream count now
+    // so the directory size and all downstream RVAs account for them.
+    streamCount += includedUserStreamCount;
+
     memoryListSize64 = writeFullMemory
         ? sizeof(ULONG64) + sizeof(ULONG64) + fullMemoryRangeCount * sizeof(MINIDUMP_MEMORY_DESCRIPTOR64)
         : sizeof(ULONG32) + selectedMemoryRangeCount * sizeof(MINIDUMP_MEMORY_DESCRIPTOR);
 
-    if (writeFullMemory && fixedSize + memoryListSize64 + g_FullMemoryBytes > hardMaxFileSize) {
+    if (writeFullMemory &&
+        fixedSize + memoryListSize64 + g_FullMemoryBytes + userStreamBytes +
+                static_cast<ULONG64>(includedUserStreamCount) * sizeof(MINIDUMP_DIRECTORY) >
+            hardMaxFileSize) {
         SetLastError(ERROR_FILE_TOO_LARGE);
         return FALSE;
     }
@@ -236,6 +289,12 @@ BOOL WriteMiniDumpInprocImpl(
     // contextRva simply aliases the exception thread's slot inside the contiguous context array.
     threadContextsRva = nextRva; nextRva += threadContextsSize;
     contextRva = threadContextsRva + exceptionThreadIndex * sizeof(CONTEXT);
+    // Caller user-stream byte blobs, laid out contiguously (each 4-byte padded) right after the
+    // thread contexts. Their directory entries (added below) point at these RVAs.
+    for (ULONG32 i = 0; i < includedUserStreamCount; ++i) {
+        g_UserStreams[i].Rva = nextRva;
+        nextRva += static_cast<ULONG32>(Align4(g_UserStreams[i].BufferSize));
+    }
     // The Memory(64)List descriptors carry RVAs that point here; the actual region bytes are the
     // last thing in the file, streamed after all fixed-size structures are placed.
     memoryBaseRva = nextRva;
@@ -303,6 +362,15 @@ BOOL WriteMiniDumpInprocImpl(
         directories[streamIndex].Location.DataSize = exceptionStreamSize;
         ++streamIndex;
     }
+    // One directory entry per admitted user stream, using the caller-supplied StreamType and the
+    // RVA assigned during layout. StreamType collisions with built-in streams are the caller's
+    // responsibility, exactly as with MiniDumpWriteDump's UserStreamParam.
+    for (ULONG32 i = 0; i < includedUserStreamCount; ++i) {
+        directories[streamIndex].StreamType = g_UserStreams[i].Type;
+        directories[streamIndex].Location.Rva = g_UserStreams[i].Rva;
+        directories[streamIndex].Location.DataSize = g_UserStreams[i].BufferSize;
+        ++streamIndex;
+    }
 
     // Mandatory file structure: header + stream directory. A failure here means the file is
     // unusable, so it is the only part that hard-aborts the dump.
@@ -354,7 +422,9 @@ BOOL WriteMiniDumpInprocImpl(
 
     INPROC_EMIT_STREAM(systemInfoRva, WriteSystemInfo(hFile));
     INPROC_EMIT_STREAM(miscInfoRva, WriteMiscInfo(hFile));
-    INPROC_EMIT_STREAM_RESULT(commentRva, WriteCommentStream(hFile, commentStreamSize));
+    // CommentStreamA is intentionally written LAST (after all other streams below) so the elapsed
+    // time patched into it reflects almost the entire dump. Its file region was laid out at
+    // commentRva and is seeked to at the end.
     INPROC_EMIT_STREAM(moduleListRva, WriteModuleList(hFile, moduleCount, moduleListRva));
     INPROC_EMIT_STREAM(threadListRva, WriteThreadList(hFile, threadCount, threadContextsRva, \
         memoryBaseRva, writeSelectedMemory));
@@ -379,6 +449,27 @@ BOOL WriteMiniDumpInprocImpl(
     } else {
         INPROC_EMIT_STREAM(memoryBaseRva, WriteSelectedMemoryBytes(hFile, threadCount, includeDataSegs, indirectRangeCount));
     }
+    // Caller user-stream blobs are laid out contiguously from the first stream's RVA; one seek there
+    // plus sequential writes places every stream. Guarded by the same per-stream SEH as the rest.
+    if (includedUserStreamCount != 0) {
+        INPROC_EMIT_STREAM(g_UserStreams[0].Rva, WriteUserStreams(hFile, includedUserStreamCount));
+    }
+
+    // Everything else is on disk now: measure total elapsed (microseconds), patch it into the
+    // prebuilt comment buffer, and write CommentStreamA last so its duration is representative.
+    {
+        LARGE_INTEGER perfEnd = {};
+        LARGE_INTEGER perfFreq = {};
+        QueryPerformanceCounter(&perfEnd);
+        QueryPerformanceFrequency(&perfFreq);
+        ULONG64 elapsedMicros = 0;
+        if (perfFreq.QuadPart > 0 && perfEnd.QuadPart > perfStart.QuadPart) {
+            elapsedMicros = static_cast<ULONG64>(perfEnd.QuadPart - perfStart.QuadPart) * 1000000ULL /
+                            static_cast<ULONG64>(perfFreq.QuadPart);
+        }
+        PatchCommentElapsed(elapsedMicros);
+    }
+    INPROC_EMIT_STREAM_RESULT(commentRva, WriteCommentStream(hFile, commentStreamSize));
 #undef INPROC_EMIT_STREAM
 #undef INPROC_EMIT_STREAM_RESULT
 
@@ -413,6 +504,7 @@ extern "C" MINIDUMP_INPROC_API BOOL WINAPI WriteMiniDumpInproc(
     HANDLE hFile,
     MINIDUMP_TYPE DumpType,
     PMINIDUMP_EXCEPTION_INFORMATION ExceptionParam,
+    PMINIDUMP_USER_STREAM_INFORMATION UserStreamParam,
     ULONG64 MaxFileSize) noexcept
 {
     if (hFile == nullptr || hFile == INVALID_HANDLE_VALUE) {
@@ -445,7 +537,7 @@ extern "C" MINIDUMP_INPROC_API BOOL WINAPI WriteMiniDumpInproc(
 #if defined(_MSC_VER)
     __try {
 #endif
-        result = minidump_inproc::internal::WriteMiniDumpInprocImpl(hFile, DumpType, ExceptionParam, MaxFileSize);
+        result = minidump_inproc::internal::WriteMiniDumpInprocImpl(hFile, DumpType, ExceptionParam, UserStreamParam, MaxFileSize);
 #if defined(_MSC_VER)
     } __except (minidump_inproc::internal::SwallowMiniDumpFault(GetExceptionCode())) {
         result = FALSE;

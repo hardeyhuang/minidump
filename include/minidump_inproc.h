@@ -50,10 +50,18 @@ extern "C" {
 // cannot fit under the hard cap, the function fails with ERROR_FILE_TOO_LARGE rather than silently
 // truncating. For selected-memory dumps the 32-bit MemoryList RVAs also impose a hard ~4 GB limit; if
 // the final layout would exceed either limit, the function fails with ERROR_FILE_TOO_LARGE.
+//
+// UserStreamParam (optional, may be NULL): MiniDumpWriteDump-style user-defined streams. Each entry's
+// Buffer/BufferSize is written verbatim as a stream whose StreamType is the caller-supplied Type. Up
+// to 16 streams are honored. User streams are admitted with HIGHER priority than
+// MiniDumpWithIndirectlyReferencedMemory but are still subject to MaxFileSize: they are included in
+// array order until one would exceed the cap, after which it and the rest are dropped. The caller
+// owns the buffers (read at write time); an unreadable buffer is zero-filled rather than failing.
 MINIDUMP_INPROC_API BOOL WINAPI WriteMiniDumpInproc(
     HANDLE hFile,
     MINIDUMP_TYPE DumpType,
     PMINIDUMP_EXCEPTION_INFORMATION ExceptionParam,
+    PMINIDUMP_USER_STREAM_INFORMATION UserStreamParam,
     ULONG64 MaxFileSize) MINIDUMP_INPROC_NOEXCEPT;
 
 // Optionally pre-resolves the low-level system/NTDLL routines this library needs (cached native

@@ -30,10 +30,18 @@ namespace minidump_inproc::internal {
 
 inline constexpr ULONG32 kMaxModules = 4096;
 inline constexpr ULONG32 kMaxThreads = 1024;
+// Maximum caller-provided user streams (MiniDumpWriteDump-style UserStreamParam) honored per dump.
+// Bounds the static plan array and the stream-directory slack so no heap is needed.
+inline constexpr ULONG32 kMaxUserStreams = 16;
 inline constexpr ULONG32 kMaxModuleNameBytes = 32766;
 inline constexpr ULONG32 kMaxCodeViewRecordBytes = 4096;
 inline constexpr ULONG32 kCodeViewSignatureRsds = 0x53445352;
 inline constexpr ULONG32 kIndirectMemoryRangeSize = 4096;
+// Memory byte-streaming block size. WriteRegionBytes probes and writes a whole block in one
+// WriteFile on the common all-readable path (instead of one WriteFile per 4 KB page), only dropping
+// to page granularity to isolate and zero-fill faulting pages. This cuts syscalls by ~256x for large
+// committed regions (the dominant cost of MiniDumpWithFullMemory) without changing the output bytes.
+inline constexpr ULONG32 kMemoryWriteBlockBytes = 1024 * 1024;
 
 // Deepest indirect-reference layer collected for MiniDumpWithIndirectlyReferencedMemory.
 // Layer 1 = pages referenced from thread stacks; 2/3 = transitively referenced pages. Relevance
@@ -52,6 +60,14 @@ inline constexpr ULONG kProcessVmCounters = 3;
 inline constexpr ULONG kProcessHandleCount = 20;
 // ANSI comment-stream buffer: system + process memory summary text shown by WinDbg on load.
 inline constexpr ULONG32 kCommentBufferBytes = 1024;
+// Fixed-width, space-padded digit field reserved inside CommentStreamA for the total dump elapsed
+// time (microseconds). Because the comment's DataSize is fixed at layout time but the elapsed time
+// is only known after every other stream is written, BuildMemoryCommentText reserves this field and
+// PatchCommentElapsed fills it in right before the comment is written last. 10 digits covers up to
+// ~2.7 hours of microseconds, far more than any real dump.
+inline constexpr ULONG32 kCommentElapsedWidth = 10;
+// Sentinel meaning "no elapsed field was reserved" (e.g. the buffer was too full to fit it).
+inline constexpr ULONG32 kCommentElapsedUnset = 0xFFFFFFFFu;
 
 // One shared scratch buffer is reused across non-overlapping phases to keep the static
 // footprint small: first as the NtQuerySystemInformation process snapshot (consumed entirely
@@ -232,6 +248,15 @@ struct INPROC_MEMORY_RANGE {
     ULONG32 Layer;   // indirect-scan BFS depth (1 = referenced by a stack, 2/3 = transitive); 0 otherwise. Free: fills existing padding.
 };
 
+// One caller-provided user stream (snapshot of a MINIDUMP_USER_STREAM entry). Buffer points into the
+// caller's memory and is read at write time; Rva is assigned during file layout.
+struct INPROC_USER_STREAM {
+    ULONG32 Type;
+    ULONG32 BufferSize;
+    const void* Buffer;
+    ULONG32 Rva;
+};
+
 // A 64-bit memory range used to capture the full-memory plan once so the descriptor
 // pass and the byte pass always agree on count and size (no live re-walk).
 struct INPROC_MEMORY_RANGE64 {
@@ -315,6 +340,8 @@ extern SYSTEM_INFO g_NativeSystemInfo;
 // dump. Static so it persists from layout computation to the write pass; dumps are serialized.
 extern char g_CommentBuffer[kCommentBufferBytes];
 extern ULONG32 g_CommentBytes;
+// Byte offset of the reserved elapsed-time digit field inside g_CommentBuffer, or kCommentElapsedUnset.
+extern ULONG32 g_CommentElapsedOffset;
 extern ULONG32 g_IndirectMemoryRangeCount;
 extern INPROC_MEMORY_RANGE g_KnownMemoryRanges[kMaxKnownMemoryRanges];
 extern ULONG32 g_KnownMemoryRangeCount;
@@ -336,6 +363,10 @@ extern ULONG32 g_ExceptionThreadIndex;
 // Number of committed full-memory ranges captured in the scratch buffer.
 extern ULONG32 g_FullMemoryRangeCount;
 extern ULONG64 g_FullMemoryBytes;
+
+// Snapshot of the caller-provided user streams (UserStreamParam) and its count, built once per dump.
+extern INPROC_USER_STREAM g_UserStreams[kMaxUserStreams];
+extern ULONG32 g_UserStreamCount;
 
 // Effective per-dump cap on indirect-memory ranges (derived from MaxFileSize and buffer capacity).
 extern ULONG32 g_IndirectMemoryRangeCap;
@@ -623,6 +654,20 @@ BOOL WriteMiscInfo(HANDLE hFile) noexcept;
 // string even if the underlying queries fail. Safe to call before file layout.
 ULONG32 BuildMemoryCommentText() noexcept;
 
+// Patches the reserved fixed-width elapsed-time field in g_CommentBuffer (reserved by
+// BuildMemoryCommentText) with the measured total dump duration in microseconds, right-justified
+// and space-padded. Safe no-op if no field was reserved (g_CommentElapsedOffset == sentinel).
+void PatchCommentElapsed(ULONG64 elapsedMicros) noexcept;
+
+// Snapshots the caller-provided user streams (MiniDumpWriteDump-style UserStreamParam) into the
+// fixed g_UserStreams plan, validating the caller structure/array under SEH. Caps to kMaxUserStreams
+// and skips NULL/empty entries. Buffer pointers are stored and read later at write time.
+void SnapshotUserStreams(PMINIDUMP_USER_STREAM_INFORMATION userStreamParam) noexcept;
+
+// Writes the first `count` admitted user-stream byte blobs contiguously at their laid-out RVAs, each
+// padded to a 4-byte boundary. Unreadable caller buffers are zero-filled (best-effort, never aborts).
+BOOL WriteUserStreams(HANDLE hFile, ULONG32 count) noexcept;
+
 // Writes CommentStreamA from g_CommentBuffer. byteLen must equal the value returned by
 // BuildMemoryCommentText (the size reserved in the stream directory).
 INPROC_STREAM_WRITE_RESULT WriteCommentStream(HANDLE hFile, ULONG32 byteLen) noexcept;
@@ -638,6 +683,7 @@ BOOL WriteMiniDumpInprocImpl(
     HANDLE hFile,
     MINIDUMP_TYPE dumpType,
     PMINIDUMP_EXCEPTION_INFORMATION exceptionParam,
+    PMINIDUMP_USER_STREAM_INFORMATION userStreamParam,
     ULONG64 maxFileSize) noexcept;
 
 } // namespace minidump_inproc::internal

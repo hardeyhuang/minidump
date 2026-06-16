@@ -54,6 +54,9 @@ if(MINIDUMP_INPROC_BUILD_SAMPLE)
     add_executable(MiniDumpInprocStressTest examples/inproc_stress_test.cpp)
     target_link_libraries(MiniDumpInprocStressTest PRIVATE MiniDumpInproc)
 
+    add_executable(Ue4LikeLargeAppCrash examples/ue4_like_large_app_crash.cpp)
+    target_link_libraries(Ue4LikeLargeAppCrash PRIVATE MiniDumpInproc)
+
     add_executable(MiniDumpInspect examples/minidump_inspect.cpp)
     target_link_libraries(MiniDumpInspect PRIVATE Dbghelp)
 
@@ -71,6 +74,10 @@ if(MINIDUMP_INPROC_BUILD_SAMPLE)
         set_target_properties(MiniDumpInprocStressTest PROPERTIES LINK_FLAGS "/ENTRY:wmainCRTStartup")
         target_compile_options(MiniDumpInspect PRIVATE /W4 /permissive-)
         set_target_properties(MiniDumpInspect PROPERTIES LINK_FLAGS "/ENTRY:wmainCRTStartup")
+        # Disable optimization for the overflow recursion so the stack actually grows (the recursive
+        # tail-call would otherwise be turned into a loop / optimized away).
+        target_compile_options(Ue4LikeLargeAppCrash PRIVATE /W4 /permissive- /Od /Ob0 /Oy-)
+        set_target_properties(Ue4LikeLargeAppCrash PROPERTIES LINK_FLAGS "/ENTRY:wmainCRTStartup")
         target_compile_options(MiniDumpOverflowStackExt PRIVATE /W4 /permissive-)
     endif()
 endif()

@@ -340,39 +340,51 @@ void PrintFrameRow(IDebugControl* control, const SyntheticFrame& frame, ULONG in
     // index, not an address -> Range error). The closest working frame-scoped action is to dump that
     // frame's stack region with dps, so the frame number links to dps over a window from Child-SP.
     // The Call Site links to disassembly at the call; the source link opens that line.
-    ULONG frameSlots = 16;
-    if (frame.HasSource && frame.Line != 0) {
+    const ULONG frameSlots = 16;
+
+    // Emit the row in pieces (DML links are self-contained per chunk) so the optional Shadow column
+    // can be placed INLINE between RetAddr and Call Site instead of on a separate line.
+    // Frame number (links to dps over the frame's stack window) + Child-SP + RetAddr.
+    control->ControlledOutput(DEBUG_OUTCTL_DML, DEBUG_OUTPUT_NORMAL,
+        "<link cmd=\"dps %s L%lu\">%02lu</link> %s %s ",
+        childSpText, frameSlots, index, childSpText, retAddrText);
+
+    // Shadow column (between RetAddr and Call Site): the slot address as a clickable link that dumps
+    // the per-frame shadow-stack window. Same fixed width as an address so Call Site stays aligned.
+    if (shadowBytes != 0) {
+        const ULONG count = (shadowBytes + pointerSize - 1) / pointerSize;
         control->ControlledOutput(DEBUG_OUTCTL_DML, DEBUG_OUTPUT_NORMAL,
-            "<link cmd=\"dps %s L%lu\">%02lu</link> %s %s "
-            "<link cmd=\"u %s-0x10 L8\">%s</link> "
-            "[<link cmd=\"lsa %s-1\">%s @ %lu</link>]\n",
-            childSpText, frameSlots, index,
-            childSpText, retAddrText,
-            retAddrText, frame.Symbol,
-            retAddrText, frame.Source, frame.Line);
-    } else {
-        control->ControlledOutput(DEBUG_OUTCTL_DML, DEBUG_OUTPUT_NORMAL,
-            "<link cmd=\"dps %s L%lu\">%02lu</link> %s %s "
-            "<link cmd=\"u %s-0x10 L8\">%s</link>\n",
-            childSpText, frameSlots, index,
-            childSpText, retAddrText,
-            retAddrText, frame.Symbol);
+            "<link cmd=\"dps %s L%lu\">%s</link> ",
+            slotText, count, slotText);
     }
 
-    if (shadowBytes != 0) {
-        ULONG count = (shadowBytes + pointerSize - 1) / pointerSize;
+    // Call Site (links to disassembly at the call).
+    control->ControlledOutput(DEBUG_OUTCTL_DML, DEBUG_OUTPUT_NORMAL,
+        "<link cmd=\"u %s-0x10 L8\">%s</link>",
+        retAddrText, frame.Symbol);
+
+    // Optional source location (links to the source line).
+    if (frame.HasSource && frame.Line != 0) {
         control->ControlledOutput(DEBUG_OUTCTL_DML, DEBUG_OUTPUT_NORMAL,
-            "      <link cmd=\"dps %s L%lu\">shadow @ %s (0x%lx bytes)</link>\n",
-            slotText, count, slotText, shadowBytes);
+            " [<link cmd=\"lsa %s-1\">%s @ %lu</link>]",
+            retAddrText, frame.Source, frame.Line);
     }
+
+    control->ControlledOutput(DEBUG_OUTCTL_DML, DEBUG_OUTPUT_NORMAL, "\n");
 }
 
 void PrintFrameList(IDebugControl* control, FrameList* frames, ULONG pointerSize, ULONG shadowBytes) noexcept
 {
     NormalizeLogicalOverflowStack(frames);
-    control->Output(DEBUG_OUTPUT_NORMAL, " # %-17s RetAddr%*s Call Site [Source]\n",
-                    pointerSize == 4 ? "ChildEBP" : "Child-SP",
-                    pointerSize == 4 ? 1 : 10, "");
+    const int addrWidth = (pointerSize == 4) ? 8 : 17;
+    const char* childLabel = (pointerSize == 4) ? "ChildEBP" : "Child-SP";
+    if (shadowBytes != 0) {
+        control->Output(DEBUG_OUTPUT_NORMAL, " # %-*s %-*s %-*s Call Site [Source]\n",
+                        addrWidth, childLabel, addrWidth, "RetAddr", addrWidth, "Shadow");
+    } else {
+        control->Output(DEBUG_OUTPUT_NORMAL, " # %-*s %-*s Call Site [Source]\n",
+                        addrWidth, childLabel, addrWidth, "RetAddr");
+    }
 
     ULONG shownIndex = 0;
     for (ULONG i = 0; i < frames->Count;) {

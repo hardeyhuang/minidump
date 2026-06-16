@@ -79,7 +79,7 @@ DWORD WINAPI DumpThreadProc(LPVOID) noexcept
         info.ThreadId = g_ExceptionThreadId;
         info.ExceptionPointers = g_ExceptionPointers;
         info.ClientPointers = FALSE;
-        BOOL ok = WriteMiniDumpInproc(file, g_DumpType, &info, g_MaxFileSize);
+        BOOL ok = WriteMiniDumpInproc(file, g_DumpType, &info, nullptr, g_MaxFileSize);
         InterlockedExchange(&g_DumpResult, ok ? 1 : 0);
         FlushFileBuffers(file);
         CloseHandle(file);

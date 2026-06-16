@@ -539,21 +539,40 @@ BOOL CountExtraMemoryRanges(BOOL includeDataSegs,
 
 BOOL WriteRegionBytes(HANDLE hFile, BYTE* base, SIZE_T size) noexcept
 {
-    DWORD pageSize = NativePageSize();
+    const DWORD pageSize = NativePageSize();
     BYTE* cursor = base;
     SIZE_T remaining = size;
 
     while (remaining != 0) {
-        SIZE_T chunk = remaining > pageSize ? pageSize : remaining;
-        if (SafeReadBytes(cursor, chunk)) {
-            if (!WriteAll(hFile, cursor, chunk)) {
+        SIZE_T block = remaining > kMemoryWriteBlockBytes ? kMemoryWriteBlockBytes : remaining;
+
+        // Fast path: probe the whole block once; if every page is readable, write it in a single
+        // call. This is the common case and avoids a WriteFile per 4 KB page.
+        if (SafeReadBytes(cursor, block)) {
+            if (!WriteAll(hFile, cursor, block)) {
                 return FALSE;
             }
-        } else if (!WriteZeros(hFile, chunk)) {
-            return FALSE;
+        } else {
+            // Slow path: some page inside this block faults. Drop to page granularity so only the
+            // unreadable pages are zero-filled while the readable ones are still captured.
+            BYTE* pageCursor = cursor;
+            SIZE_T pageRemaining = block;
+            while (pageRemaining != 0) {
+                SIZE_T chunk = pageRemaining > pageSize ? pageSize : pageRemaining;
+                if (SafeReadBytes(pageCursor, chunk)) {
+                    if (!WriteAll(hFile, pageCursor, chunk)) {
+                        return FALSE;
+                    }
+                } else if (!WriteZeros(hFile, chunk)) {
+                    return FALSE;
+                }
+                pageCursor += chunk;
+                pageRemaining -= chunk;
+            }
         }
-        cursor += chunk;
-        remaining -= chunk;
+
+        cursor += block;
+        remaining -= block;
     }
     return TRUE;
 }
@@ -745,24 +764,14 @@ BOOL WriteMemoryDescriptors(HANDLE hFile, ULONG64 rangeCount, ULONG64 memoryBase
 
 BOOL WriteMemoryBytes(HANDLE hFile, ULONG64 rangeCount) noexcept
 {
-    DWORD pageSize = NativePageSize();
-
     const INPROC_MEMORY_RANGE64* fullRanges = FullMemoryRanges();
     for (ULONG32 i = 0; i < g_FullMemoryRangeCount && i < rangeCount; ++i) {
-        BYTE* cursor = reinterpret_cast<BYTE*>(static_cast<ULONG_PTR>(fullRanges[i].Start));
-        ULONG64 remaining = fullRanges[i].Size;
-
-        while (remaining != 0) {
-            SIZE_T chunk = remaining > pageSize ? pageSize : static_cast<SIZE_T>(remaining);
-            if (SafeReadBytes(cursor, chunk)) {
-                if (!WriteAll(hFile, cursor, chunk)) {
-                    return FALSE;
-                }
-            } else if (!WriteZeros(hFile, chunk)) {
-                return FALSE;
-            }
-            cursor += chunk;
-            remaining -= chunk;
+        // Region sizes come from VirtualQuery (SIZE_T), so the ULONG64 plan value fits SIZE_T.
+        // WriteRegionBytes handles large-block fast path + per-page fault isolation uniformly.
+        if (!WriteRegionBytes(hFile,
+                              reinterpret_cast<BYTE*>(static_cast<ULONG_PTR>(fullRanges[i].Start)),
+                              static_cast<SIZE_T>(fullRanges[i].Size))) {
+            return FALSE;
         }
     }
 

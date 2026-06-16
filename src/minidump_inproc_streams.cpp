@@ -300,6 +300,21 @@ ULONG32 BuildMemoryCommentText() noexcept
 
     pos = CommentAppendStr(buf, cap, pos, "\n");
 
+    // 4th line: total dump elapsed time. The value is unknown here (it depends on how long the rest
+    // of the dump takes), so reserve a fixed-width, space-padded digit field and remember its offset;
+    // PatchCommentElapsed fills it in right before CommentStreamA is written last. Reserving keeps the
+    // stream's DataSize stable while still letting the final number vary in width.
+    pos = CommentAppendStr(buf, cap, pos, "ProcTime: Elapsed=");
+    g_CommentElapsedOffset = kCommentElapsedUnset;
+    if (pos + kCommentElapsedWidth + 4u < cap) { // room for the field + "us" + "\n" + NUL
+        g_CommentElapsedOffset = pos;
+        for (ULONG32 i = 0; i < kCommentElapsedWidth; ++i) {
+            buf[pos++] = ' ';
+        }
+        pos = CommentAppendStr(buf, cap, pos, "us");
+    }
+    pos = CommentAppendStr(buf, cap, pos, "\n");
+
     // NUL-terminate, then pad to a 4-byte boundary. The buffer is zero-initialized, so the padding
     // bytes are already 0; WinDbg reads CommentStreamA as a NUL-terminated string so trailing zeros
     // are harmless. DataSize == the returned aligned length.
@@ -318,6 +333,42 @@ ULONG32 BuildMemoryCommentText() noexcept
 }
 
 
+// Patches the reserved fixed-width elapsed-time field with the measured total dump duration
+// (microseconds), right-justified and space-padded. Heap-free; safe no-op if no field was reserved.
+
+void PatchCommentElapsed(ULONG64 elapsedMicros) noexcept
+{
+    if (g_CommentElapsedOffset == kCommentElapsedUnset ||
+        g_CommentElapsedOffset + kCommentElapsedWidth > kCommentBufferBytes) {
+        return;
+    }
+
+    // Render the decimal digits least-significant-first.
+    char digits[24];
+    ULONG32 count = 0;
+    if (elapsedMicros == 0) {
+        digits[count++] = '0';
+    }
+    while (elapsedMicros != 0 && count < sizeof(digits)) {
+        digits[count++] = static_cast<char>('0' + static_cast<int>(elapsedMicros % 10));
+        elapsedMicros /= 10;
+    }
+    // Clamp to the reserved width (overflow would be absurdly long; keep the low digits).
+    if (count > kCommentElapsedWidth) {
+        count = kCommentElapsedWidth;
+    }
+
+    char* field = g_CommentBuffer + g_CommentElapsedOffset;
+    const ULONG32 padding = kCommentElapsedWidth - count; // right-justify with leading spaces
+    for (ULONG32 i = 0; i < padding; ++i) {
+        field[i] = ' ';
+    }
+    for (ULONG32 i = 0; i < count; ++i) {
+        field[padding + i] = digits[count - 1 - i];
+    }
+}
+
+
 // Writes the prebuilt CommentStreamA bytes. The content was captured by BuildMemoryCommentText
 // before file layout, so this pass only streams the fixed-size buffer and cannot fault.
 
@@ -330,6 +381,70 @@ INPROC_STREAM_WRITE_RESULT WriteCommentStream(HANDLE hFile, ULONG32 byteLen) noe
         byteLen = kCommentBufferBytes;
     }
     return StreamResultFromBool(WriteAll(hFile, g_CommentBuffer, byteLen));
+}
+
+
+// Snapshots the caller-provided user streams into the fixed g_UserStreams plan. The caller structure
+// and array are read under SEH (SafeCopyBytes) so a malformed UserStreamParam cannot fault the dump.
+// NULL/empty entries are skipped; the count is capped to kMaxUserStreams.
+
+void SnapshotUserStreams(PMINIDUMP_USER_STREAM_INFORMATION userStreamParam) noexcept
+{
+    g_UserStreamCount = 0;
+    if (userStreamParam == nullptr) {
+        return;
+    }
+
+    MINIDUMP_USER_STREAM_INFORMATION info = {};
+    if (!SafeCopyBytes(&info, userStreamParam, sizeof(info))) {
+        return;
+    }
+    if (info.UserStreamArray == nullptr || info.UserStreamCount == 0) {
+        return;
+    }
+
+    for (ULONG i = 0; i < info.UserStreamCount && g_UserStreamCount < kMaxUserStreams; ++i) {
+        MINIDUMP_USER_STREAM entry = {};
+        if (!SafeCopyBytes(&entry, &info.UserStreamArray[i], sizeof(entry))) {
+            break;
+        }
+        if (entry.Buffer == nullptr || entry.BufferSize == 0) {
+            continue;
+        }
+        g_UserStreams[g_UserStreamCount].Type = entry.Type;
+        g_UserStreams[g_UserStreamCount].BufferSize = entry.BufferSize;
+        g_UserStreams[g_UserStreamCount].Buffer = entry.Buffer;
+        g_UserStreams[g_UserStreamCount].Rva = 0;
+        ++g_UserStreamCount;
+    }
+}
+
+
+// Writes the admitted user-stream byte blobs contiguously at their laid-out RVAs, each padded to a
+// 4-byte boundary. The blobs are placed contiguously by the layout pass, so one initial seek (done
+// by the caller's emit macro) plus sequential writes lands every stream at its descriptor's RVA.
+// Unreadable caller buffers are zero-filled (best-effort) rather than aborting the dump.
+
+BOOL WriteUserStreams(HANDLE hFile, ULONG32 count) noexcept
+{
+    for (ULONG32 i = 0; i < count && i < g_UserStreamCount; ++i) {
+        const ULONG32 size = g_UserStreams[i].BufferSize;
+        const BYTE* buffer = static_cast<const BYTE*>(g_UserStreams[i].Buffer);
+
+        if (SafeReadBytes(buffer, size)) {
+            if (!WriteAll(hFile, buffer, size)) {
+                return FALSE;
+            }
+        } else if (!WriteZeros(hFile, size)) {
+            return FALSE;
+        }
+
+        const ULONG32 padding = static_cast<ULONG32>(Align4(size)) - size;
+        if (padding != 0 && !WriteZeros(hFile, padding)) {
+            return FALSE;
+        }
+    }
+    return TRUE;
 }
 
 

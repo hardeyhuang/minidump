@@ -8,6 +8,7 @@ volatile LONG g_ApisInitialized = 0;
 SYSTEM_INFO g_NativeSystemInfo = {};
 char g_CommentBuffer[kCommentBufferBytes] = {};
 ULONG32 g_CommentBytes = 0;
+ULONG32 g_CommentElapsedOffset = kCommentElapsedUnset;
 ULONG32 g_IndirectMemoryRangeCount = 0;
 INPROC_MEMORY_RANGE g_KnownMemoryRanges[kMaxKnownMemoryRanges] = {};
 ULONG32 g_KnownMemoryRangeCount = 0;
@@ -22,6 +23,9 @@ ULONG32 g_ExceptionThreadIndex = 0;
 ULONG32 g_FullMemoryRangeCount = 0;
 ULONG64 g_FullMemoryBytes = 0;
 ULONG32 g_IndirectMemoryRangeCap = 0;
+
+INPROC_USER_STREAM g_UserStreams[kMaxUserStreams] = {};
+ULONG32 g_UserStreamCount = 0;
 
 namespace {
 // Resolves the required NTDLL routines automatically at module load so the crash path never

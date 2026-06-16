@@ -27,10 +27,23 @@ LONG WINAPI DumpUnhandledExceptionFilter(PEXCEPTION_POINTERS exceptionPointers)
     exceptionInfo.ExceptionPointers = exceptionPointers;
     exceptionInfo.ClientPointers = FALSE;
 
+    // Demonstrate UserStreamParam: attach an arbitrary application-defined stream. The Type uses the
+    // CommentStreamA id here only so generic dump viewers print it; real apps use their own ids
+    // (>= LastReservedStream, e.g. 0xffff0000+) for custom payloads.
+    static const char kUserNote[] = "MiniDumpInprocSample user stream: build info / app state here.";
+    MINIDUMP_USER_STREAM userStream = {};
+    userStream.Type = CommentStreamA;
+    userStream.BufferSize = static_cast<ULONG>(sizeof(kUserNote));
+    userStream.Buffer = const_cast<char*>(kUserNote);
+    MINIDUMP_USER_STREAM_INFORMATION userStreamInfo = {};
+    userStreamInfo.UserStreamCount = 1;
+    userStreamInfo.UserStreamArray = &userStream;
+
     (void)WriteMiniDumpInproc(
         hFile,
         static_cast<MINIDUMP_TYPE>(MiniDumpNormal | MiniDumpWithThreadInfo),
         &exceptionInfo,
+        &userStreamInfo,
         0); // 0 = no size limit
 
     CloseHandle(hFile);
