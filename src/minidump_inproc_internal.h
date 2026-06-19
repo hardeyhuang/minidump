@@ -87,10 +87,10 @@ inline constexpr ULONG kProcessHandleCount = 20;
 // ANSI comment-stream buffer: system + process memory summary text shown by WinDbg on load.
 inline constexpr ULONG32 kCommentBufferBytes = 1024;
 // Fixed-width, space-padded digit field reserved inside CommentStreamA for the total dump elapsed
-// time (microseconds). Because the comment's DataSize is fixed at layout time but the elapsed time
+// time (milliseconds). Because the comment's DataSize is fixed at layout time but the elapsed time
 // is only known after every other stream is written, BuildMemoryCommentText reserves this field and
-// PatchCommentElapsed fills it in right before the comment is written last. 10 digits covers up to
-// ~2.7 hours of microseconds, far more than any real dump.
+// PatchCommentElapsed fills it in right before the comment is written last. 10 digits covers far more
+// milliseconds than any real dump would ever take.
 inline constexpr ULONG32 kCommentElapsedWidth = 10;
 // Sentinel meaning "no elapsed field was reserved" (e.g. the buffer was too full to fit it).
 inline constexpr ULONG32 kCommentElapsedUnset = 0xFFFFFFFFu;
@@ -787,9 +787,9 @@ BOOL WriteMiscInfo(HANDLE hFile) noexcept;
 ULONG32 BuildMemoryCommentText() noexcept;
 
 // Patches the reserved fixed-width elapsed-time field in g_CommentBuffer (reserved by
-// BuildMemoryCommentText) with the measured total dump duration in microseconds, right-justified
+// BuildMemoryCommentText) with the measured total dump duration in milliseconds, right-justified
 // and space-padded. Safe no-op if no field was reserved (g_CommentElapsedOffset == sentinel).
-void PatchCommentElapsed(ULONG64 elapsedMicros) noexcept;
+void PatchCommentElapsed(ULONG64 elapsedMillis) noexcept;
 
 // Snapshots the caller-provided user streams (MiniDumpWriteDump-style UserStreamParam) into the
 // fixed g_UserStreams plan, validating the caller structure/array under SEH. Caps to kMaxUserStreams

@@ -452,77 +452,79 @@ BOOL CommentIniApply(const wchar_t* section, const wchar_t* key, const wchar_t* 
 } // namespace
 
 
-// Builds the ANSI comment text (system + process memory summary) into g_CommentBuffer. The crash
-// path stays heap-free: values come from a kernel32 syscall wrapper (GlobalMemoryStatusEx) and a
-// pre-resolved NtQueryInformationProcess, both SEH-guarded, and the text is formatted in place.
-// WinDbg automatically prints CommentStreamA when the dump is opened.
+// Builds the ANSI comment text (system + process memory summary) into g_CommentBuffer, formatted as
+// INI ([Section] + Key=Value lines) to mirror the user CommentStreamW layout. The crash path stays
+// heap-free: values come from a kernel32 syscall wrapper (GlobalMemoryStatusEx) and a pre-resolved
+// NtQueryInformationProcess, both SEH-guarded, and the text is formatted in place. WinDbg
+// automatically prints CommentStreamA when the dump is opened.
 
 ULONG32 BuildMemoryCommentText() noexcept
 {
     char* buf = g_CommentBuffer;
     const ULONG32 cap = kCommentBufferBytes;
+    // INI layout: each metric group is a [Section] header followed by one Key=Value per line, matching
+    // the user CommentStreamW format so the same parsers/eyes can read both. A leading newline keeps
+    // the first section on its own line when WinDbg prints the comment.
     ULONG32 pos = CommentAppendStr(buf, cap, 0, "\n");
 
     MEMORYSTATUSEX sysMem = {};
-    pos = CommentAppendStr(buf, cap, pos, "SysMem: ");
+    pos = CommentAppendStr(buf, cap, pos, "[SysMem]\n");
     if (QuerySystemMemory(&sysMem)) {
         pos = CommentAppendStr(buf, cap, pos, "Load=");
         pos = CommentAppendU64(buf, cap, pos, sysMem.dwMemoryLoad);
-        pos = CommentAppendStr(buf, cap, pos, "% PhysTotal=");
+        pos = CommentAppendStr(buf, cap, pos, "%\nPhysTotal=");
         pos = CommentAppendMB(buf, cap, pos, sysMem.ullTotalPhys);
-        pos = CommentAppendStr(buf, cap, pos, " PhysAvail=");
+        pos = CommentAppendStr(buf, cap, pos, "\nPhysAvail=");
         pos = CommentAppendMB(buf, cap, pos, sysMem.ullAvailPhys);
-        pos = CommentAppendStr(buf, cap, pos, " CommitTotal=");
+        pos = CommentAppendStr(buf, cap, pos, "\nCommitTotal=");
         pos = CommentAppendMB(buf, cap, pos, sysMem.ullTotalPageFile);
-        pos = CommentAppendStr(buf, cap, pos, " CommitAvail=");
+        pos = CommentAppendStr(buf, cap, pos, "\nCommitAvail=");
         pos = CommentAppendMB(buf, cap, pos, sysMem.ullAvailPageFile);
-        pos = CommentAppendStr(buf, cap, pos, " VirtTotal=");
+        pos = CommentAppendStr(buf, cap, pos, "\nVirtTotal=");
         pos = CommentAppendMB(buf, cap, pos, sysMem.ullTotalVirtual);
-        pos = CommentAppendStr(buf, cap, pos, " VirtAvail=");
+        pos = CommentAppendStr(buf, cap, pos, "\nVirtAvail=");
         pos = CommentAppendMB(buf, cap, pos, sysMem.ullAvailVirtual);
+        pos = CommentAppendStr(buf, cap, pos, "\n");
     } else {
-        pos = CommentAppendStr(buf, cap, pos, "unavailable");
+        pos = CommentAppendStr(buf, cap, pos, "State=unavailable\n");
     }
-
-    pos = CommentAppendStr(buf, cap, pos, "\n");
 
     INPROC_VM_COUNTERS_EX procMem = {};
     const BOOL gotProcMem = QueryProcessMemory(&procMem);
-    pos = CommentAppendStr(buf, cap, pos, "ProcMem: ");
+    pos = CommentAppendStr(buf, cap, pos, "[ProcMem]\n");
     if (gotProcMem) {
         pos = CommentAppendStr(buf, cap, pos, "WorkingSet=");
         pos = CommentAppendMB(buf, cap, pos, procMem.WorkingSetSize);
-        pos = CommentAppendStr(buf, cap, pos, " PeakWorkingSet=");
+        pos = CommentAppendStr(buf, cap, pos, "\nPeakWorkingSet=");
         pos = CommentAppendMB(buf, cap, pos, procMem.PeakWorkingSetSize);
-        pos = CommentAppendStr(buf, cap, pos, " PrivateCommit=");
+        pos = CommentAppendStr(buf, cap, pos, "\nPrivateCommit=");
         pos = CommentAppendMB(buf, cap, pos, procMem.PrivateUsage);
-        pos = CommentAppendStr(buf, cap, pos, " PeakCommit=");
+        pos = CommentAppendStr(buf, cap, pos, "\nPeakCommit=");
         pos = CommentAppendMB(buf, cap, pos, procMem.PeakPagefileUsage);
-        pos = CommentAppendStr(buf, cap, pos, " VirtSize=");
+        pos = CommentAppendStr(buf, cap, pos, "\nVirtSize=");
         pos = CommentAppendMB(buf, cap, pos, procMem.VirtualSize);
-        pos = CommentAppendStr(buf, cap, pos, " PeakVirtSize=");
+        pos = CommentAppendStr(buf, cap, pos, "\nPeakVirtSize=");
         pos = CommentAppendMB(buf, cap, pos, procMem.PeakVirtualSize);
-        pos = CommentAppendStr(buf, cap, pos, " PageFaults=");
+        pos = CommentAppendStr(buf, cap, pos, "\nPageFaults=");
         pos = CommentAppendU64(buf, cap, pos, procMem.PageFaultCount);
+        pos = CommentAppendStr(buf, cap, pos, "\n");
     } else {
-        pos = CommentAppendStr(buf, cap, pos, "unavailable");
+        pos = CommentAppendStr(buf, cap, pos, "State=unavailable\n");
     }
 
-    pos = CommentAppendStr(buf, cap, pos, "\n");
-
-    // Kernel-pool quota, handle counts and GUI object counts: the key signals for kernel-object /
-    // handle / GDI-USER leak diagnosis.
-    pos = CommentAppendStr(buf, cap, pos, "ProcRes: ");
+    // [ProcRes]: kernel-pool quota, handle counts and GUI object counts: the key signals for
+    // kernel-object / handle / GDI-USER leak diagnosis.
+    pos = CommentAppendStr(buf, cap, pos, "[ProcRes]\n");
     if (gotProcMem) {
         pos = CommentAppendStr(buf, cap, pos, "PagedPool=");
         pos = CommentAppendKB(buf, cap, pos, procMem.QuotaPagedPoolUsage);
-        pos = CommentAppendStr(buf, cap, pos, " PeakPagedPool=");
+        pos = CommentAppendStr(buf, cap, pos, "\nPeakPagedPool=");
         pos = CommentAppendKB(buf, cap, pos, procMem.QuotaPeakPagedPoolUsage);
-        pos = CommentAppendStr(buf, cap, pos, " NonPagedPool=");
+        pos = CommentAppendStr(buf, cap, pos, "\nNonPagedPool=");
         pos = CommentAppendKB(buf, cap, pos, procMem.QuotaNonPagedPoolUsage);
-        pos = CommentAppendStr(buf, cap, pos, " PeakNonPagedPool=");
+        pos = CommentAppendStr(buf, cap, pos, "\nPeakNonPagedPool=");
         pos = CommentAppendKB(buf, cap, pos, procMem.QuotaPeakNonPagedPoolUsage);
-        pos = CommentAppendStr(buf, cap, pos, " ");
+        pos = CommentAppendStr(buf, cap, pos, "\n");
     }
 
     ULONG handleCount = 0;
@@ -530,37 +532,37 @@ ULONG32 BuildMemoryCommentText() noexcept
     if (QueryProcessHandleCounts(&handleCount, &handlePeak)) {
         pos = CommentAppendStr(buf, cap, pos, "Handles=");
         pos = CommentAppendU64(buf, cap, pos, handleCount);
-        pos = CommentAppendStr(buf, cap, pos, " PeakHandles=");
+        pos = CommentAppendStr(buf, cap, pos, "\nPeakHandles=");
         pos = CommentAppendU64(buf, cap, pos, handlePeak);
+        pos = CommentAppendStr(buf, cap, pos, "\n");
     } else {
-        pos = CommentAppendStr(buf, cap, pos, "Handles=n/a");
+        pos = CommentAppendStr(buf, cap, pos, "Handles=n/a\n");
     }
 
     ULONG gdiObjects = 0;
     ULONG userObjects = 0;
     if (QueryGuiResources(&gdiObjects, &userObjects)) {
-        pos = CommentAppendStr(buf, cap, pos, " GDI=");
+        pos = CommentAppendStr(buf, cap, pos, "GDI=");
         pos = CommentAppendU64(buf, cap, pos, gdiObjects);
-        pos = CommentAppendStr(buf, cap, pos, " USER=");
+        pos = CommentAppendStr(buf, cap, pos, "\nUSER=");
         pos = CommentAppendU64(buf, cap, pos, userObjects);
+        pos = CommentAppendStr(buf, cap, pos, "\n");
     } else {
-        pos = CommentAppendStr(buf, cap, pos, " GDI=n/a USER=n/a");
+        pos = CommentAppendStr(buf, cap, pos, "GDI=n/a\nUSER=n/a\n");
     }
 
-    pos = CommentAppendStr(buf, cap, pos, "\n");
-
-    // 4th line: total dump elapsed time. The value is unknown here (it depends on how long the rest
-    // of the dump takes), so reserve a fixed-width, space-padded digit field and remember its offset;
-    // PatchCommentElapsed fills it in right before CommentStreamA is written last. Reserving keeps the
-    // stream's DataSize stable while still letting the final number vary in width.
-    pos = CommentAppendStr(buf, cap, pos, "ProcTime: Elapsed=");
+    // [ProcTime] Elapsed: total dump elapsed time. The value is unknown here (it depends on how long
+    // the rest of the dump takes), so reserve a fixed-width, space-padded digit field and remember its
+    // offset; PatchCommentElapsed fills it in right before CommentStreamA is written last. Reserving
+    // keeps the stream's DataSize stable while still letting the final number vary in width.
+    pos = CommentAppendStr(buf, cap, pos, "[ProcTime]\nElapsed=");
     g_CommentElapsedOffset = kCommentElapsedUnset;
-    if (pos + kCommentElapsedWidth + 4u < cap) { // room for the field + "us" + "\n" + NUL
+    if (pos + kCommentElapsedWidth + 4u < cap) { // room for the field + "ms" + "\n" + NUL
         g_CommentElapsedOffset = pos;
         for (ULONG32 i = 0; i < kCommentElapsedWidth; ++i) {
             buf[pos++] = ' ';
         }
-        pos = CommentAppendStr(buf, cap, pos, "us");
+        pos = CommentAppendStr(buf, cap, pos, "ms");
     }
     pos = CommentAppendStr(buf, cap, pos, "\n");
 
@@ -583,9 +585,9 @@ ULONG32 BuildMemoryCommentText() noexcept
 
 
 // Patches the reserved fixed-width elapsed-time field with the measured total dump duration
-// (microseconds), right-justified and space-padded. Heap-free; safe no-op if no field was reserved.
+// (milliseconds), right-justified and space-padded. Heap-free; safe no-op if no field was reserved.
 
-void PatchCommentElapsed(ULONG64 elapsedMicros) noexcept
+void PatchCommentElapsed(ULONG64 elapsedMillis) noexcept
 {
     if (g_CommentElapsedOffset == kCommentElapsedUnset ||
         g_CommentElapsedOffset + kCommentElapsedWidth > kCommentBufferBytes) {
@@ -595,12 +597,12 @@ void PatchCommentElapsed(ULONG64 elapsedMicros) noexcept
     // Render the decimal digits least-significant-first.
     char digits[24];
     ULONG32 count = 0;
-    if (elapsedMicros == 0) {
+    if (elapsedMillis == 0) {
         digits[count++] = '0';
     }
-    while (elapsedMicros != 0 && count < sizeof(digits)) {
-        digits[count++] = static_cast<char>('0' + static_cast<int>(elapsedMicros % 10));
-        elapsedMicros /= 10;
+    while (elapsedMillis != 0 && count < sizeof(digits)) {
+        digits[count++] = static_cast<char>('0' + static_cast<int>(elapsedMillis % 10));
+        elapsedMillis /= 10;
     }
     // Clamp to the reserved width (overflow would be absurdly long; keep the low digits).
     if (count > kCommentElapsedWidth) {
@@ -650,7 +652,7 @@ BOOL SetCommentIniW(const wchar_t* section, const wchar_t* key, const wchar_t* v
         YieldProcessor();
     }
 
-    BOOL ok;
+    BOOL ok = FALSE;
 #if defined(_MSC_VER)
     __try {
         ok = CommentIniApply(section, key, value, oper);

@@ -31,7 +31,7 @@ BOOL WriteMiniDumpInproc(
 | **并发崩溃** | `InterlockedCompareExchange` 单入口串行化，多线程同时崩溃只写一次 | 无内建串行化，需调用方自行加锁 |
 | **大小控制** | 原生支持 `MaxFileSize` 硬上限 + **优先级裁剪**（崩溃栈/主线程栈优先，其它栈和可选内存按预算裁剪） | 无大小上限参数；体积由 `DumpType` 决定，要么全要么无 |
 | **间接引用内存** | **多层 BFS 指针扫描**（崩溃线程子树优先，去重哈希 + VirtualQuery 缓存） | `MiniDumpWithIndirectlyReferencedMemory` 为单层引用，且依赖堆分配 |
-| **功能完整度** | 裁剪实现：`HandleData` / `TokenInformation` 等**有意不写**（见下）；`UnloadedModules` 已按需支持（`MiniDumpWithUnloadedModules`） | **功能完整**：句柄、Token、卸载模块、回调扩展等全面支持 |
+| **功能完整度** | 裁剪实现：`HandleData` / `TokenInformation` 等**有意不写**（见下） | **功能完整**：句柄、Token、回调扩展等全面支持 |
 | **可扩展回调** | 无 `MINIDUMP_CALLBACK`（崩溃路径刻意保持简单） | 支持 `CallbackParam` 回调，可精细控制每个 stream/内存块 |
 | **可靠性定位** | 进程内**兜底/降级**路径，天然不如外部进程可靠 | 外部进程模式是**最可靠**形态（地址空间独立） |
 

@@ -543,19 +543,19 @@ BOOL WriteMiniDumpInprocImpl(
         INPROC_EMIT_STREAM(g_UserStreams[0].Rva, WriteUserStreams(hFile, includedUserStreamCount));
     }
 
-    // Everything else is on disk now: measure total elapsed (microseconds), patch it into the
+    // Everything else is on disk now: measure total elapsed (milliseconds), patch it into the
     // prebuilt comment buffer, and write CommentStreamA last so its duration is representative.
     {
         LARGE_INTEGER perfEnd = {};
         LARGE_INTEGER perfFreq = {};
         QueryPerformanceCounter(&perfEnd);
         QueryPerformanceFrequency(&perfFreq);
-        ULONG64 elapsedMicros = 0;
+        ULONG64 elapsedMillis = 0;
         if (perfFreq.QuadPart > 0 && perfEnd.QuadPart > perfStart.QuadPart) {
-            elapsedMicros = static_cast<ULONG64>(perfEnd.QuadPart - perfStart.QuadPart) * 1000000ULL /
+            elapsedMillis = static_cast<ULONG64>(perfEnd.QuadPart - perfStart.QuadPart) * 1000ULL /
                             static_cast<ULONG64>(perfFreq.QuadPart);
         }
-        PatchCommentElapsed(elapsedMicros);
+        PatchCommentElapsed(elapsedMillis);
     }
     INPROC_EMIT_STREAM_RESULT(commentRva, WriteCommentStream(hFile, commentStreamSize));
 #undef INPROC_EMIT_STREAM
