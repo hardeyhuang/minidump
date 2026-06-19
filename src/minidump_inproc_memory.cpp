@@ -436,6 +436,61 @@ BOOL ScanStackForIndirectMemory(ULONG64 stackStart,
 }
 
 
+// Feeds every general-purpose integer register of a thread context into the indirect collector as a
+// root at `layer`. Registers routinely hold live object pointers (the faulting `this`, a function
+// argument, a freshly returned allocation) that were never spilled to the stack, so without this the
+// BFS would miss exactly the pages most relevant to a crash. sourceStart/sourceEnd are 0 because a
+// register has no backing range to self-exclude; any value landing in a stack page (RSP/RBP) or code
+// page (RIP) is filtered downstream like every other candidate, so RSP/RIP are intentionally omitted
+// here (already captured as stack/module). Returns FALSE only when the per-dump cap is reached.
+
+static BOOL ScanContextRegistersForIndirectMemory(const CONTEXT* context, ULONG32 layer) noexcept
+{
+    if (context == nullptr) {
+        return TRUE;
+    }
+#if defined(_M_X64)
+    const ULONG64 regs[] = {
+        context->Rax, context->Rcx, context->Rdx, context->Rbx, context->Rbp,
+        context->Rsi, context->Rdi, context->R8,  context->R9,  context->R10,
+        context->R11, context->R12, context->R13, context->R14, context->R15,
+    };
+#elif defined(_M_IX86)
+    const ULONG64 regs[] = {
+        static_cast<ULONG64>(context->Eax), static_cast<ULONG64>(context->Ecx),
+        static_cast<ULONG64>(context->Edx), static_cast<ULONG64>(context->Ebx),
+        static_cast<ULONG64>(context->Ebp), static_cast<ULONG64>(context->Esi),
+        static_cast<ULONG64>(context->Edi),
+    };
+#else
+    const ULONG64 regs[1] = { 0 };
+#endif
+    for (ULONG32 i = 0; i < ARRAYSIZE(regs) && g_IndirectMemoryRangeCount < g_IndirectMemoryRangeCap; ++i) {
+        if (!AddIndirectMemoryRangeFromPointer(regs[i], 0, 0, layer)) {
+            return FALSE;
+        }
+    }
+    return g_IndirectMemoryRangeCount < g_IndirectMemoryRangeCap;
+}
+
+
+// Captures a frozen thread's register context (consistent with the captured stack: all non-current
+// threads are suspended for the entire dump). Returns FALSE if the context is unavailable.
+
+static BOOL CaptureThreadContextForScan(const INPROC_THREAD_PLAN_ENTRY& entry, CONTEXT* context) noexcept
+{
+    if (entry.IsCurrent) {
+        RtlCaptureContext(context);
+        return TRUE;
+    }
+    if (entry.Handle != nullptr && entry.Suspended) {
+        context->ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER;
+        return GetThreadContext(entry.Handle, context);
+    }
+    return FALSE;
+}
+
+
 // Precomputes stack and data-segment MemoryList ranges so indirect pages can be checked against all known ranges.
 
 void CollectKnownSelectedMemoryRanges(ULONG32 threadCount, BOOL includeDataSegs) noexcept
@@ -494,21 +549,36 @@ BOOL CollectIndirectMemoryRanges(ULONG32 threadCount,
 
     ULONG32 bfsHead = 0;
 
-    // Phase 1: the faulting thread's stack (layer 1) and its full transitive subtree.
+    // Phase 1: the faulting thread's registers and stack (layer 1) plus its full transitive subtree.
+    // Registers are seeded before the stack so a pointer that lives only in a register (never spilled)
+    // still anchors its target page first when the budget is tight.
     for (ULONG32 i = 0; i < g_ThreadPlanCount; ++i) {
-        if (g_ThreadPlan[i].ThreadId == preferredThreadId && g_ThreadPlan[i].IncludeStack && g_ThreadPlan[i].StackSize != 0) {
+        if (g_ThreadPlan[i].ThreadId != preferredThreadId) {
+            continue;
+        }
+        (void)ScanContextRegistersForIndirectMemory(preferredContext, 1);
+        if (g_ThreadPlan[i].IncludeStack && g_ThreadPlan[i].StackSize != 0) {
             (void)ScanStackForIndirectMemory(g_ThreadPlan[i].StackStart, g_ThreadPlan[i].StackSize, preferredContext);
             if (g_ThreadPlan[i].AuxStackSize != 0 && g_IndirectMemoryRangeCount < g_IndirectMemoryRangeCap) {
                 (void)ScanStackForIndirectMemory(g_ThreadPlan[i].AuxStackStart, g_ThreadPlan[i].AuxStackSize, nullptr);
             }
-            break;
         }
+        break;
     }
     bfsHead = ExpandIndirectBfs(bfsHead);
 
-    // Phase 2: remaining threads' stacks (layer 1), then expand their subtrees.
+    // Phase 2: remaining threads' registers and stacks (layer 1), then expand their subtrees. Each
+    // thread is frozen for the whole dump, so its live register context is consistent with the stack
+    // bytes captured elsewhere.
+    CONTEXT threadContext;
     for (ULONG32 i = 0; i < g_ThreadPlanCount && g_IndirectMemoryRangeCount < g_IndirectMemoryRangeCap; ++i) {
-        if (g_ThreadPlan[i].ThreadId == preferredThreadId || !g_ThreadPlan[i].IncludeStack || g_ThreadPlan[i].StackSize == 0) {
+        if (g_ThreadPlan[i].ThreadId == preferredThreadId) {
+            continue;
+        }
+        if (CaptureThreadContextForScan(g_ThreadPlan[i], &threadContext)) {
+            (void)ScanContextRegistersForIndirectMemory(&threadContext, 1);
+        }
+        if (!g_ThreadPlan[i].IncludeStack || g_ThreadPlan[i].StackSize == 0) {
             continue;
         }
         (void)ScanStackForIndirectMemory(g_ThreadPlan[i].StackStart, g_ThreadPlan[i].StackSize, nullptr);

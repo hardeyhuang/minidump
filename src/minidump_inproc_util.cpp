@@ -72,6 +72,10 @@ void ResolveInprocApis() noexcept
         GetProcAddress(ntdll, "NtQuerySystemInformation"));
     g_Apis.NtQueryInformationProcess = reinterpret_cast<NtQueryInformationProcessFn>(
         GetProcAddress(ntdll, "NtQueryInformationProcess"));
+    // Unloaded-module ring accessor (Windows Vista+). When absent (very old OS), the
+    // UnloadedModuleListStream is simply omitted.
+    g_Apis.RtlGetUnloadEventTraceEx = reinterpret_cast<RtlGetUnloadEventTraceExFn>(
+        GetProcAddress(ntdll, "RtlGetUnloadEventTraceEx"));
 
     // GDI/USER object counts come from user32!GetGuiResources. Resolve it ONLY if user32 is already
     // mapped (GetModuleHandleW, never LoadLibraryW) so this library never forces a user32 dependency

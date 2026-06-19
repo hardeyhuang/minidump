@@ -31,7 +31,7 @@ BOOL WriteMiniDumpInproc(
 | **并发崩溃** | `InterlockedCompareExchange` 单入口串行化，多线程同时崩溃只写一次 | 无内建串行化，需调用方自行加锁 |
 | **大小控制** | 原生支持 `MaxFileSize` 硬上限 + **优先级裁剪**（崩溃栈/主线程栈优先，其它栈和可选内存按预算裁剪） | 无大小上限参数；体积由 `DumpType` 决定，要么全要么无 |
 | **间接引用内存** | **多层 BFS 指针扫描**（崩溃线程子树优先，去重哈希 + VirtualQuery 缓存） | `MiniDumpWithIndirectlyReferencedMemory` 为单层引用，且依赖堆分配 |
-| **功能完整度** | 裁剪实现：`HandleData` / `TokenInformation` / `UnloadedModules` 等**有意不写**（见下） | **功能完整**：句柄、Token、卸载模块、回调扩展等全面支持 |
+| **功能完整度** | 裁剪实现：`HandleData` / `TokenInformation` 等**有意不写**（见下）；`UnloadedModules` 已按需支持（`MiniDumpWithUnloadedModules`） | **功能完整**：句柄、Token、卸载模块、回调扩展等全面支持 |
 | **可扩展回调** | 无 `MINIDUMP_CALLBACK`（崩溃路径刻意保持简单） | 支持 `CallbackParam` 回调，可精细控制每个 stream/内存块 |
 | **可靠性定位** | 进程内**兜底/降级**路径，天然不如外部进程可靠 | 外部进程模式是**最可靠**形态（地址空间独立） |
 
@@ -49,7 +49,7 @@ BOOL WriteMiniDumpInproc(
 
 ### 支持的 `MINIDUMP_TYPE` 标志与支持程度
 
-固定写入（与标志无关，始终产出）：`SystemInfoStream`、`MiscInfoStream`、`CommentStreamA`、`ModuleListStream`、`ThreadListStream` + 全部线程 `CONTEXT`；传入异常信息时附带 `ExceptionStream`。另：当通过 `SetMiniDumpInprocComment*` 设置过用户注释时，附带 `CommentStreamW`（见下）。
+固定写入（与标志无关，始终产出）：`SystemInfoStream`、`MiscInfoStream`、`CommentStreamA`、`ModuleListStream`、`ThreadListStream` + 全部线程 `CONTEXT`；传入异常信息时附带 `ExceptionStream`。另：当通过 `SetMiniDumpInprocComment*` 设置过用户注释时，附带 `CommentStreamW`（见下）；当请求 `MiniDumpWithUnloadedModules` 且 ntdll 卸载环表非空时，附带 `UnloadedModuleListStream`（见下表）。
 
 > **`CommentStreamA`（系统/进程内存与资源摘要）**：始终写入一段 ANSI 文本（四行），记录崩溃时的关键内存与资源指标，方便后续定位 OOM / 内存泄漏 / 句柄泄漏 / GDI-USER 泄漏 / 内核池泄漏，并附本次写 dump 的总耗时。**WinDbg 打开 dump 时会自动显示该 Comment**，无需额外命令；`MiniDumpInspect` 也会打印其文本。取值全程**零堆分配**、SEH 保护，查询失败则记为 `unavailable` / `n/a` 而不影响 dump。示例：
 >
@@ -99,7 +99,7 @@ BOOL WriteMiniDumpInproc(
 | `MiniDumpWithIndirectlyReferencedMemory` | ✅ 增强 | **多层 BFS 指针扫描**（见下）；可裁剪层最低优先级，按剩余预算逐页截断。未设 `MiniDumpWithDataSegs` 时，可写数据段也作为扫描目标被"按引用"收集 |
 | `MiniDumpIgnoreInaccessibleMemory` | ♾️ 始终生效 | 本实现**所有**内存区域（线程栈/数据段/间接引用/全内存）一律对不可读页补零、绝不因坏页失败；该标志因此**无论设不设都等效"已设"**，仅保留在 `header.Flags` |
 | `MiniDumpScanMemory` | ⚠️ 忽略 | 不做模块引用标记，标志仅保留在 `header.Flags` |
-| `MiniDumpWithUnloadedModules` | ❌ 不写 | 不写 `UnloadedModuleListStream`（进程内无可靠、无堆的卸载模块表来源），标志仅保留在 `header.Flags` |
+| `MiniDumpWithUnloadedModules` | ✅ 按需写 | **设置**=从 ntdll 卸载模块环表写 `UnloadedModuleListStream`（让 WinDbg 能命名崩溃前刚卸载 DLL 的栈帧），无堆分配、`SafeCopyBytes` 全程保护、跳过空槽；**不设**=完全不读环表、不写该流 |
 | `MiniDumpWithHandleData` | ❌ 不写 | 见"为什么不写 `HandleDataStream`" |
 | `MiniDumpWithTokenInformation` | ❌ 不写 | 崩溃路径采集 Token 价值低、易触发危险调用，标志仅保留在 `header.Flags` |
 | 其它未列出标志 | ⚠️ 忽略 | 不报错，按未实现处理，仅保留在 `header.Flags` |

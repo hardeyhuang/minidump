@@ -60,6 +60,9 @@ BOOL WriteMiniDumpInprocImpl(
                                  ((requestedFlags & MiniDumpWithProcessThreadData) != 0);
     BOOL includeDataSegs = (requestedFlags & MiniDumpWithDataSegs) != 0;
     const BOOL includeIndirectMemory = (requestedFlags & MiniDumpWithIndirectlyReferencedMemory) != 0;
+    // UnloadedModuleListStream is opt-in: the caller must request MiniDumpWithUnloadedModules, matching
+    // MiniDumpWriteDump's behavior. Without the flag the ntdll unload ring is never touched.
+    const BOOL includeUnloadedModules = (requestedFlags & MiniDumpWithUnloadedModules) != 0;
     // MiniDumpIgnoreInaccessibleMemory is intentionally not honored: unreadable pages are always
     // zero-filled so a partially unreadable region never aborts the dump (best-effort output).
 
@@ -67,11 +70,18 @@ BOOL WriteMiniDumpInprocImpl(
 
     ULONG32 headerRva = 0, directoryRva = sizeof(MINIDUMP_HEADER);
     ULONG32 systemInfoRva = 0, miscInfoRva = 0, commentRva = 0, commentWRva = 0, moduleListRva = 0, threadListRva = 0;
+    ULONG32 unloadedModuleListRva = 0;
     ULONG32 threadInfoListRva = 0, memoryInfoListRva = 0, memoryListRva = 0;
     ULONG32 exceptionRva = 0, threadContextsRva = 0, contextRva = 0;
     ULONG64 memoryBaseRva = 0;
 
     ULONG32 moduleListStreamSize = 0, moduleListStorageSize = 0, threadListStreamSize = 0;
+    // UnloadedModuleListStream: present only when MiniDumpWithUnloadedModules is requested AND ntdll's
+    // unload ring has at least one entry. Both the stream content (header + fixed entries) and trailing
+    // MINIDUMP_STRING name storage are fixed.
+    ULONG32 unloadedModuleCount = 0, unloadedModuleNameBytes = 0;
+    ULONG32 unloadedModuleListStreamSize = 0, unloadedModuleListStorageSize = 0;
+    BOOL writeUnloadedModules = FALSE;
     ULONG64 threadContextsSize64 = 0, threadInfoListSize64 = 0, memoryInfoListSize64 = 0;
     ULONG64 memoryListSize64 = 0, selectedMemoryRangeCount = 0;
 
@@ -85,9 +95,9 @@ BOOL WriteMiniDumpInprocImpl(
     BOOL writeThreadNames = FALSE;
 
     MINIDUMP_HEADER header = {};
-    // Up to 11 built-in stream entries (6 always-present + CommentStreamW/Exception/ThreadInfo/
-    // MemoryInfo/ThreadNames) plus one entry per admitted user stream.
-    MINIDUMP_DIRECTORY directories[11 + kMaxUserStreams] = {};
+    // Up to 12 built-in stream entries (6 always-present + CommentStreamW/Exception/ThreadInfo/
+    // MemoryInfo/ThreadNames/UnloadedModuleList) plus one entry per admitted user stream.
+    MINIDUMP_DIRECTORY directories[12 + kMaxUserStreams] = {};
     LARGE_INTEGER pos = {};
 
     hasException = CaptureExceptionStreamInfo(exceptionParam, &exceptionProbe, &contextProbe);
@@ -126,6 +136,21 @@ BOOL WriteMiniDumpInprocImpl(
     if (!CountModules(&moduleCount, &moduleNameBytes, &moduleCodeViewBytes)) {
         moduleCount = 0; moduleNameBytes = 0; moduleCodeViewBytes = 0;
     }
+
+    // Unloaded modules: a crash IP or return address landing in a DLL unloaded shortly before the
+    // fault (plugin/COM/delay-load teardown) cannot be named by ModuleList alone. The ntdll ring read
+    // here lets WinDbg resolve such frames. Opt-in via MiniDumpWithUnloadedModules; without the flag
+    // the ring is never read. Degrade to no stream on failure rather than aborting.
+    if (includeUnloadedModules && !CountUnloadedModules(&unloadedModuleCount, &unloadedModuleNameBytes)) {
+        unloadedModuleCount = 0; unloadedModuleNameBytes = 0;
+    }
+    writeUnloadedModules = includeUnloadedModules && (unloadedModuleCount != 0);
+    if (writeUnloadedModules) {
+        ++streamCount;
+        unloadedModuleListStreamSize = static_cast<ULONG32>(sizeof(INPROC_MINIDUMP_UNLOADED_MODULE_LIST)) +
+                                       unloadedModuleCount * static_cast<ULONG32>(sizeof(INPROC_MINIDUMP_UNLOADED_MODULE));
+        unloadedModuleListStorageSize = unloadedModuleListStreamSize + unloadedModuleNameBytes;
+    }
     if (writeMemoryInfo && !CountMemoryInfoRanges(&memoryInfoRangeCount)) {
         memoryInfoRangeCount = 0; // keep a structurally valid, empty MemoryInfoList stream
     }
@@ -162,6 +187,7 @@ BOOL WriteMiniDumpInprocImpl(
         commentStreamSize +
         (writeCommentW ? commentWStreamSize : 0) +
         moduleListStorageSize +
+        (writeUnloadedModules ? unloadedModuleListStorageSize : 0) +
         threadListStreamSize +
         threadContextsSize64 +
         (hasException ? exceptionStreamSize : 0) +
@@ -300,15 +326,16 @@ BOOL WriteMiniDumpInprocImpl(
     // stream's directory entry point at a fixed, final offset, and lets us write streams with simple
     // SetFilePointerEx seeks (so a skipped/faulting stream cannot shift any other stream's position).
     // Physical order: header -> directory -> SystemInfo -> MiscInfo -> CommentStreamA ->
-    // ModuleList(+strings/CV) -> ThreadList -> [ThreadNames(+name strings)] -> [ThreadInfoList] ->
-    // [MemoryInfoList] -> Memory(64)List descriptors -> [Exception] -> thread CONTEXT records ->
-    // memory bytes backing store.
+    // ModuleList(+strings/CV) -> [UnloadedModuleList(+name strings)] -> ThreadList ->
+    // [ThreadNames(+name strings)] -> [ThreadInfoList] -> [MemoryInfoList] -> Memory(64)List
+    // descriptors -> [Exception] -> thread CONTEXT records -> memory bytes backing store.
     ULONG32 nextRva = directoryRva + streamCount * sizeof(MINIDUMP_DIRECTORY);
     systemInfoRva = nextRva; nextRva += sizeof(MINIDUMP_SYSTEM_INFO);
     miscInfoRva = nextRva; nextRva += sizeof(MINIDUMP_MISC_INFO);
     commentRva = nextRva; nextRva += commentStreamSize;
     if (writeCommentW) { commentWRva = nextRva; nextRva += commentWStreamSize; }
     moduleListRva = nextRva; nextRva += moduleListStorageSize;
+    if (writeUnloadedModules) { unloadedModuleListRva = nextRva; nextRva += unloadedModuleListStorageSize; }
     threadListRva = nextRva; nextRva += threadListStreamSize;
     if (writeThreadNames) { threadNamesRva = nextRva; nextRva += threadNamesStorageSize; }
     if (writeThreadInfo) { threadInfoListRva = nextRva; nextRva += threadInfoListSize; }
@@ -373,6 +400,12 @@ BOOL WriteMiniDumpInprocImpl(
     directories[streamIndex].Location.Rva = moduleListRva;
     directories[streamIndex].Location.DataSize = moduleListStreamSize;
     ++streamIndex;
+    if (writeUnloadedModules) {
+        directories[streamIndex].StreamType = kUnloadedModuleListStreamType;
+        directories[streamIndex].Location.Rva = unloadedModuleListRva;
+        directories[streamIndex].Location.DataSize = unloadedModuleListStreamSize;
+        ++streamIndex;
+    }
     directories[streamIndex].StreamType = ThreadListStream;
     directories[streamIndex].Location.Rva = threadListRva;
     directories[streamIndex].Location.DataSize = threadListStreamSize;
@@ -474,6 +507,10 @@ BOOL WriteMiniDumpInprocImpl(
     // time patched into it reflects almost the entire dump. Its file region was laid out at
     // commentRva and is seeked to at the end.
     INPROC_EMIT_STREAM(moduleListRva, WriteModuleList(hFile, moduleCount, moduleListRva));
+    if (writeUnloadedModules) {
+        INPROC_EMIT_STREAM(unloadedModuleListRva, \
+            WriteUnloadedModuleList(hFile, unloadedModuleCount, unloadedModuleListRva));
+    }
     INPROC_EMIT_STREAM(threadListRva, WriteThreadList(hFile, threadCount, threadContextsRva, \
         memoryBaseRva, writeSelectedMemory));
     if (writeThreadNames) {
@@ -626,10 +663,10 @@ extern "C" MINIDUMP_INPROC_API BOOL WINAPI SetMiniDumpInprocCommentA(
     COMMENT_STRING_OPER_TYPE oper) noexcept
 {
     constexpr int kIdCap = static_cast<int>(minidump_inproc::internal::kCommentMaxSectionKeyChars) + 1;
-    constexpr int kValCap = static_cast<int>(minidump_inproc::internal::kCommentBufferWChars);
-    wchar_t wsection[minidump_inproc::internal::kCommentMaxSectionKeyChars + 1];
-    wchar_t wkey[minidump_inproc::internal::kCommentMaxSectionKeyChars + 1];
-    wchar_t wvalue[minidump_inproc::internal::kCommentBufferWChars];
+    constexpr int kValCap = static_cast<int>(minidump_inproc::internal::kCommentMaxValueChars) + 1;
+    wchar_t wsection[kIdCap];
+    wchar_t wkey[kIdCap];
+    wchar_t wvalue[kValCap];
     const wchar_t* ps = nullptr;
     const wchar_t* pk = nullptr;
     const wchar_t* pv = nullptr;

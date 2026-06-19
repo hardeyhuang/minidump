@@ -41,6 +41,12 @@ inline constexpr ULONG kThreadNameInformation = 38;
 // MINIDUMP_STREAM_TYPE::ThreadNamesStream. Hardcoded so the build does not depend on the SDK
 // dbghelp.h being recent enough to define the enumerator.
 inline constexpr ULONG32 kThreadNamesStreamType = 24;
+// MINIDUMP_STREAM_TYPE::UnloadedModuleListStream. Hardcoded for the same reason as the thread-names
+// type, so the build never depends on the SDK dbghelp.h version.
+inline constexpr ULONG32 kUnloadedModuleListStreamType = 14;
+// Upper bound on unloaded-module trace entries captured. The ntdll ring buffer holds at most ~64;
+// this cap merely guards against an implausibly large/garbage ElementCount and bounds the directory.
+inline constexpr ULONG32 kMaxUnloadedModules = 256;
 // Maximum caller-provided user streams (MiniDumpWriteDump-style UserStreamParam) honored per dump.
 // Bounds the static plan array and the stream-directory slack so no heap is needed.
 inline constexpr ULONG32 kMaxUserStreams = 16;
@@ -326,6 +332,37 @@ struct INPROC_MINIDUMP_THREAD_NAME_LIST {
 static_assert(sizeof(INPROC_MINIDUMP_THREAD_NAME) == 16, "MINIDUMP_THREAD_NAME on-disk size must be 16");
 static_assert(sizeof(INPROC_MINIDUMP_THREAD_NAME_LIST) == 8, "MINIDUMP_THREAD_NAME_LIST header on-disk size must be 8");
 
+// In-process view of ntdll's RTL_UNLOAD_EVENT_TRACE entry. Only the leading documented fields are
+// declared; RtlGetUnloadEventTraceEx reports the real per-entry stride (which may carry a trailing
+// Version field plus padding), so iteration uses that reported stride and reads just these fields.
+struct INPROC_RTL_UNLOAD_EVENT_TRACE {
+    PVOID BaseAddress;
+    SIZE_T SizeOfImage;
+    ULONG Sequence;
+    ULONG TimeDateStamp;
+    ULONG CheckSum;
+    WCHAR ImageName[32];
+};
+
+// On-disk UnloadedModuleListStream layout, mirroring MINIDUMP_UNLOADED_MODULE_LIST /
+// MINIDUMP_UNLOADED_MODULE. Defined locally so the build never depends on the SDK dbghelp.h version.
+// The stream DataSize is header + entries only; the trailing MINIDUMP_STRING name blobs referenced by
+// ModuleNameRva are stored after the stream (like ModuleListStream) and not counted in DataSize.
+struct INPROC_MINIDUMP_UNLOADED_MODULE {
+    ULONG64 BaseOfImage;
+    ULONG32 SizeOfImage;
+    ULONG32 CheckSum;
+    ULONG32 TimeDateStamp;
+    ULONG32 ModuleNameRva;
+};
+struct INPROC_MINIDUMP_UNLOADED_MODULE_LIST {
+    ULONG32 SizeOfHeader;
+    ULONG32 SizeOfEntry;
+    ULONG32 NumberOfEntries;
+};
+static_assert(sizeof(INPROC_MINIDUMP_UNLOADED_MODULE) == 24, "MINIDUMP_UNLOADED_MODULE on-disk size must be 24");
+static_assert(sizeof(INPROC_MINIDUMP_UNLOADED_MODULE_LIST) == 12, "MINIDUMP_UNLOADED_MODULE_LIST header on-disk size must be 12");
+
 enum INPROC_STREAM_WRITE_RESULT {
     InprocStreamOk,
     InprocStreamSkip,
@@ -385,6 +422,10 @@ using NtQueryInformationProcessFn = LONG (WINAPI*)(HANDLE, ULONG, PVOID, ULONG, 
 // user32!GetGuiResources, used for GDI/USER object counts. Resolved at load time ONLY if user32 is
 // already mapped (we never LoadLibrary it), so the library never forces a user32 dependency.
 using GetGuiResourcesFn = DWORD (WINAPI*)(HANDLE, DWORD);
+// ntdll!RtlGetUnloadEventTraceEx: returns pointers to the process-wide unloaded-module ring buffer
+// (per-entry size, entry count, array base). A pure read of an ntdll global -- no heap, no loader
+// lock -- so it is safe to query on the crash path.
+using RtlGetUnloadEventTraceExFn = void (WINAPI*)(PULONG*, PULONG*, PVOID*);
 
 struct INPROC_API_TABLE {
     RtlGetVersionFn RtlGetVersion;
@@ -392,6 +433,7 @@ struct INPROC_API_TABLE {
     NtQuerySystemInformationFn NtQuerySystemInformation;
     NtQueryInformationProcessFn NtQueryInformationProcess;
     GetGuiResourcesFn GetGuiResources;   // may be null when user32 is not loaded
+    RtlGetUnloadEventTraceExFn RtlGetUnloadEventTraceEx;  // may be null on very old OS
 };
 
 extern CONTEXT g_ContextScratch;
@@ -543,6 +585,17 @@ BOOL WriteModuleCodeViewRecord(HANDLE hFile, PVOID moduleBase, ULONG32* writtenS
 
 // Writes ModuleListStream descriptors and their trailing strings/CodeView records; stream size excludes trailing storage per minidump rules.
 BOOL WriteModuleList(HANDLE hFile, ULONG32 moduleCount, ULONG32 moduleListRva) noexcept;
+
+// Counts entries in ntdll's unloaded-module ring (RtlGetUnloadEventTraceEx) and the trailing
+// MINIDUMP_STRING name storage they need. A pure read of an ntdll global: no heap, no loader lock.
+// Degrades to an empty stream (count 0) when the routine is unavailable or the table looks invalid.
+BOOL CountUnloadedModules(ULONG32* count, ULONG32* nameBytes) noexcept;
+
+// Writes UnloadedModuleListStream (header + fixed-size entries) plus the trailing MINIDUMP_STRING
+// name blobs referenced by each entry's ModuleNameRva. streamRva is the stream's own RVA. Re-reads
+// the same frozen ntdll ring as CountUnloadedModules so descriptor count and name storage stay
+// consistent. The stream DataSize excludes the trailing name storage, per minidump rules.
+BOOL WriteUnloadedModuleList(HANDLE hFile, ULONG32 count, ULONG32 streamRva) noexcept;
 
 
 // Copies the caller-provided exception record and context pointers into minidump exception-stream form.

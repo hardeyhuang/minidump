@@ -340,5 +340,197 @@ BOOL WriteModuleList(HANDLE hFile, ULONG32 moduleCount, ULONG32 moduleListRva) n
 }
 
 
+// Returns the NUL-terminated length (in bytes, excluding the terminator) of an unloaded module's
+// inline ImageName, capped to the fixed 32-WCHAR field. The buffer was already safely copied into a
+// local INPROC_RTL_UNLOAD_EVENT_TRACE, so direct indexing here is safe.
+static ULONG32 UnloadedNameLengthBytes(const WCHAR* name) noexcept
+{
+    // ImageName is the fixed 32-WCHAR inline field of INPROC_RTL_UNLOAD_EVENT_TRACE.
+    constexpr ULONG32 kImageNameChars = static_cast<ULONG32>(sizeof(INPROC_RTL_UNLOAD_EVENT_TRACE::ImageName) / sizeof(WCHAR));
+    ULONG32 chars = 0;
+    while (chars < kImageNameChars && name[chars] != 0) {
+        ++chars;
+    }
+    return chars * static_cast<ULONG32>(sizeof(WCHAR));
+}
+
+
+// Resolves ntdll's unloaded-module ring via RtlGetUnloadEventTraceEx. Outputs the array base, the
+// per-entry stride reported by the OS, and the ring CAPACITY (capped to kMaxUnloadedModules). Returns
+// FALSE (empty) when the routine is missing or the table looks invalid. The returned pointers point
+// into an ntdll global; all subsequent reads go through SafeCopyBytes.
+//
+// API contract (verified empirically): all three out-parameters receive the ADDRESS of an ntdll
+// global, so each must be dereferenced once. In particular EventTrace yields &RtlpUnloadEventTraceEx
+// -- a pointer-TO-pointer -- so the real array base is *(void**)EventTrace, not EventTrace itself.
+// Likewise the count is the ring's fixed CAPACITY (e.g. 64), not the number of populated slots;
+// callers must skip empty slots (BaseAddress == nullptr).
+static BOOL GetUnloadEventTrace(const BYTE** base, ULONG32* elementSize, ULONG32* elementCount) noexcept
+{
+    *base = nullptr;
+    *elementSize = 0;
+    *elementCount = 0;
+    if (g_Apis.RtlGetUnloadEventTraceEx == nullptr) {
+        return FALSE;
+    }
+
+    PULONG sizePtr = nullptr;
+    PULONG countPtr = nullptr;
+    PVOID arrayPtrPtr = nullptr;
+#if defined(_MSC_VER)
+    __try {
+#endif
+        g_Apis.RtlGetUnloadEventTraceEx(&sizePtr, &countPtr, &arrayPtrPtr);
+#if defined(_MSC_VER)
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return FALSE;
+    }
+#endif
+
+    ULONG sz = 0;
+    ULONG cnt = 0;
+    const BYTE* arrayBase = nullptr;
+    // arrayPtrPtr points at the RtlpUnloadEventTraceEx pointer global; one safe deref yields the
+    // real array base (a heap allocation), which is then where the entries actually live.
+    if (!SafeCopyBytes(&sz, sizePtr, sizeof(sz)) ||
+        !SafeCopyBytes(&cnt, countPtr, sizeof(cnt)) ||
+        !SafeCopyBytes(&arrayBase, arrayPtrPtr, sizeof(arrayBase))) {
+        return FALSE;
+    }
+    // The reported stride must at least span the documented fields we read, and stay within a sane
+    // bound; a garbage stride or count means we treat the ring as empty rather than walk wild memory.
+    if (arrayBase == nullptr || cnt == 0 ||
+        sz < sizeof(INPROC_RTL_UNLOAD_EVENT_TRACE) || sz > 4096) {
+        return FALSE;
+    }
+    if (cnt > kMaxUnloadedModules) {
+        cnt = kMaxUnloadedModules;
+    }
+
+    *base = arrayBase;
+    *elementSize = sz;
+    *elementCount = cnt;
+    return TRUE;
+}
+
+
+// Counts unloaded-module ring entries and the trailing MINIDUMP_STRING storage their names need.
+BOOL CountUnloadedModules(ULONG32* count, ULONG32* nameBytes) noexcept
+{
+    *count = 0;
+    *nameBytes = 0;
+
+    const BYTE* base = nullptr;
+    ULONG32 stride = 0;
+    ULONG32 capacity = 0;
+    if (!GetUnloadEventTrace(&base, &stride, &capacity)) {
+        return TRUE; // unsupported / empty ring: emit no stream, not an error
+    }
+
+    // capacity is the ring's fixed slot count; only populated slots (BaseAddress != nullptr) are real
+    // unload records. The write pass applies the identical predicate over the same frozen ring, so the
+    // emitted descriptor count and name storage stay consistent.
+    ULONG32 valid = 0;
+    ULONG64 names = 0;
+    for (ULONG32 i = 0; i < capacity; ++i) {
+        INPROC_RTL_UNLOAD_EVENT_TRACE entry = {};
+        if (!SafeCopyBytes(&entry, base + static_cast<ULONG64>(i) * stride, sizeof(entry)) ||
+            entry.BaseAddress == nullptr) {
+            continue;
+        }
+        names += MinidumpStringSize(UnloadedNameLengthBytes(entry.ImageName));
+        ++valid;
+    }
+
+    if (names > 0xffffffffULL) {
+        return FALSE;
+    }
+    *count = valid;
+    *nameBytes = static_cast<ULONG32>(names);
+    return TRUE;
+}
+
+
+// Writes UnloadedModuleListStream (header + entries) followed by the trailing name strings.
+BOOL WriteUnloadedModuleList(HANDLE hFile, ULONG32 count, ULONG32 streamRva) noexcept
+{
+    INPROC_MINIDUMP_UNLOADED_MODULE_LIST listHeader = {};
+    listHeader.SizeOfHeader = sizeof(INPROC_MINIDUMP_UNLOADED_MODULE_LIST);
+    listHeader.SizeOfEntry = sizeof(INPROC_MINIDUMP_UNLOADED_MODULE);
+    listHeader.NumberOfEntries = count;
+    if (!WriteAll(hFile, &listHeader, sizeof(listHeader))) {
+        return FALSE;
+    }
+
+    const BYTE* base = nullptr;
+    ULONG32 stride = 0;
+    ULONG32 capacity = 0;
+    const BOOL haveTrace = GetUnloadEventTrace(&base, &stride, &capacity);
+
+    // The name strings are stored immediately after the fixed-size entry array; ModuleNameRva of each
+    // entry points at its blob. Both passes walk the same frozen ring with the identical "skip empty
+    // slot" predicate used while counting, and stop after exactly `count` emitted entries, so the
+    // descriptor array, the ModuleNameRva spacing, and the trailing strings all stay consistent.
+    ULONG32 stringRva = streamRva + sizeof(INPROC_MINIDUMP_UNLOADED_MODULE_LIST) +
+                        count * static_cast<ULONG32>(sizeof(INPROC_MINIDUMP_UNLOADED_MODULE));
+
+    ULONG32 emitted = 0;
+    for (ULONG32 i = 0; haveTrace && i < capacity && emitted < count; ++i) {
+        INPROC_RTL_UNLOAD_EVENT_TRACE entry = {};
+        if (!SafeCopyBytes(&entry, base + static_cast<ULONG64>(i) * stride, sizeof(entry)) ||
+            entry.BaseAddress == nullptr) {
+            continue;
+        }
+        INPROC_MINIDUMP_UNLOADED_MODULE module = {};
+        module.BaseOfImage = static_cast<ULONG64>(reinterpret_cast<ULONG_PTR>(entry.BaseAddress));
+        module.SizeOfImage = static_cast<ULONG32>(entry.SizeOfImage);
+        module.CheckSum = entry.CheckSum;
+        module.TimeDateStamp = entry.TimeDateStamp;
+        module.ModuleNameRva = stringRva;
+        if (!WriteAll(hFile, &module, sizeof(module))) {
+            return FALSE;
+        }
+        stringRva += MinidumpStringSize(UnloadedNameLengthBytes(entry.ImageName));
+        ++emitted;
+    }
+
+    // Trailing MINIDUMP_STRING blobs, re-read from the same ring with the same predicate so each
+    // entry's stored length matches the ModuleNameRva spacing computed above.
+    LARGE_INTEGER stringPos = {};
+    stringPos.QuadPart = streamRva + sizeof(INPROC_MINIDUMP_UNLOADED_MODULE_LIST) +
+                         count * static_cast<ULONG64>(sizeof(INPROC_MINIDUMP_UNLOADED_MODULE));
+    if (!SetFilePointerEx(hFile, stringPos, nullptr, FILE_BEGIN)) {
+        return FALSE;
+    }
+
+    emitted = 0;
+    for (ULONG32 i = 0; haveTrace && i < capacity && emitted < count; ++i) {
+        INPROC_RTL_UNLOAD_EVENT_TRACE entry = {};
+        if (!SafeCopyBytes(&entry, base + static_cast<ULONG64>(i) * stride, sizeof(entry)) ||
+            entry.BaseAddress == nullptr) {
+            continue;
+        }
+        const ULONG32 nameLen = UnloadedNameLengthBytes(entry.ImageName);
+        const ULONG32 total = MinidumpStringSize(nameLen);
+        const WCHAR nul = 0;
+        if (!WriteAll(hFile, &nameLen, sizeof(nameLen))) {
+            return FALSE;
+        }
+        if (nameLen != 0 && !WriteAll(hFile, entry.ImageName, nameLen)) {
+            return FALSE;
+        }
+        if (!WriteAll(hFile, &nul, sizeof(nul))) {
+            return FALSE;
+        }
+        if (!WriteZeros(hFile, total - sizeof(nameLen) - nameLen - sizeof(nul))) {
+            return FALSE;
+        }
+        ++emitted;
+    }
+
+    return TRUE;
+}
+
+
 
 } // namespace minidump_inproc::internal

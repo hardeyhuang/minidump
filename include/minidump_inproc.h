@@ -51,6 +51,10 @@ extern "C" {
 // truncating. For selected-memory dumps the 32-bit MemoryList RVAs also impose a hard ~4 GB limit; if
 // the final layout would exceed either limit, the function fails with ERROR_FILE_TOO_LARGE.
 //
+// MiniDumpWithUnloadedModules: opt-in flag that adds an UnloadedModuleListStream built from ntdll's
+// unloaded-module ring (so WinDbg can name a crash frame in a DLL unloaded just before the fault).
+// Without this flag the ring is never read and no such stream is emitted, even if unload records exist.
+//
 // UserStreamParam (optional, may be NULL): MiniDumpWriteDump-style user-defined streams. Each entry's
 // Buffer/BufferSize is written verbatim as a stream whose StreamType is the caller-supplied Type. Up
 // to 16 streams are honored. User streams are admitted with HIGHER priority than
