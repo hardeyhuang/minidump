@@ -78,10 +78,16 @@ BOOL WriteMiniDumpInprocImpl(
     ULONG32 threadContextsSize = 0, threadInfoListSize = 0, memoryInfoListSize = 0, memoryListSize = 0;
     ULONG32 exceptionStreamSize = 0;
 
+    // ThreadNamesStream: present only when at least one thread has a kernel-stored name. Its content
+    // size (descriptor list) and the trailing MINIDUMP_STRING storage are both fixed (non-truncatable).
+    ULONG32 threadNameCount = 0, threadNameStorageBytes = 0;
+    ULONG32 threadNamesStreamSize = 0, threadNamesStorageSize = 0, threadNamesRva = 0;
+    BOOL writeThreadNames = FALSE;
+
     MINIDUMP_HEADER header = {};
-    // Up to 9 built-in stream entries (6 always-present + Exception/ThreadInfo/MemoryInfo) plus one
-    // entry per admitted user stream.
-    MINIDUMP_DIRECTORY directories[9 + kMaxUserStreams] = {};
+    // Up to 10 built-in stream entries (6 always-present + Exception/ThreadInfo/MemoryInfo/ThreadNames)
+    // plus one entry per admitted user stream.
+    MINIDUMP_DIRECTORY directories[10 + kMaxUserStreams] = {};
     LARGE_INTEGER pos = {};
 
     hasException = CaptureExceptionStreamInfo(exceptionParam, &exceptionProbe, &contextProbe);
@@ -117,6 +123,19 @@ BOOL WriteMiniDumpInprocImpl(
         memoryInfoRangeCount = 0; // keep a structurally valid, empty MemoryInfoList stream
     }
 
+    // ThreadNamesStream is emitted only if any thread actually has a name; an empty stream would just
+    // waste a directory entry. Names were captured into the frozen plan by BuildThreadPlanAndFreeze.
+    if (!CountThreadNames(threadCount, &threadNameCount, &threadNameStorageBytes)) {
+        threadNameCount = 0; threadNameStorageBytes = 0;
+    }
+    writeThreadNames = (threadNameCount != 0);
+    if (writeThreadNames) {
+        ++streamCount;
+        threadNamesStreamSize = static_cast<ULONG32>(sizeof(INPROC_MINIDUMP_THREAD_NAME_LIST)) +
+                                threadNameCount * static_cast<ULONG32>(sizeof(INPROC_MINIDUMP_THREAD_NAME));
+        threadNamesStorageSize = threadNamesStreamSize + threadNameStorageBytes;
+    }
+
     // Sizes of the fixed (non-truncatable) streams. These do not depend on the size budget.
     moduleListStreamSize = sizeof(ULONG32) + moduleCount * sizeof(MINIDUMP_MODULE);
     moduleListStorageSize = moduleListStreamSize + moduleNameBytes + moduleCodeViewBytes;
@@ -139,7 +158,8 @@ BOOL WriteMiniDumpInprocImpl(
         threadContextsSize64 +
         (hasException ? exceptionStreamSize : 0) +
         (writeThreadInfo ? threadInfoListSize64 : 0) +
-        (writeMemoryInfo ? memoryInfoListSize64 : 0);
+        (writeMemoryInfo ? memoryInfoListSize64 : 0) +
+        (writeThreadNames ? threadNamesStorageSize : 0);
 
     if (writeFullMemory) {
         // Full-memory dumps use the 64-bit Memory64List and are meant to capture the COMPLETE set of
@@ -272,14 +292,16 @@ BOOL WriteMiniDumpInprocImpl(
     // stream's directory entry point at a fixed, final offset, and lets us write streams with simple
     // SetFilePointerEx seeks (so a skipped/faulting stream cannot shift any other stream's position).
     // Physical order: header -> directory -> SystemInfo -> MiscInfo -> CommentStreamA ->
-    // ModuleList(+strings/CV) -> ThreadList -> [ThreadInfoList] -> [MemoryInfoList] ->
-    // Memory(64)List descriptors -> [Exception] -> thread CONTEXT records -> memory bytes backing store.
+    // ModuleList(+strings/CV) -> ThreadList -> [ThreadNames(+name strings)] -> [ThreadInfoList] ->
+    // [MemoryInfoList] -> Memory(64)List descriptors -> [Exception] -> thread CONTEXT records ->
+    // memory bytes backing store.
     ULONG32 nextRva = directoryRva + streamCount * sizeof(MINIDUMP_DIRECTORY);
     systemInfoRva = nextRva; nextRva += sizeof(MINIDUMP_SYSTEM_INFO);
     miscInfoRva = nextRva; nextRva += sizeof(MINIDUMP_MISC_INFO);
     commentRva = nextRva; nextRva += commentStreamSize;
     moduleListRva = nextRva; nextRva += moduleListStorageSize;
     threadListRva = nextRva; nextRva += threadListStreamSize;
+    if (writeThreadNames) { threadNamesRva = nextRva; nextRva += threadNamesStorageSize; }
     if (writeThreadInfo) { threadInfoListRva = nextRva; nextRva += threadInfoListSize; }
     if (writeMemoryInfo) { memoryInfoListRva = nextRva; nextRva += memoryInfoListSize; }
     memoryListRva = nextRva; nextRva += memoryListSize;
@@ -340,6 +362,12 @@ BOOL WriteMiniDumpInprocImpl(
     directories[streamIndex].Location.Rva = threadListRva;
     directories[streamIndex].Location.DataSize = threadListStreamSize;
     ++streamIndex;
+    if (writeThreadNames) {
+        directories[streamIndex].StreamType = kThreadNamesStreamType;
+        directories[streamIndex].Location.Rva = threadNamesRva;
+        directories[streamIndex].Location.DataSize = threadNamesStreamSize;
+        ++streamIndex;
+    }
     if (writeThreadInfo) {
         directories[streamIndex].StreamType = ThreadInfoListStream;
         directories[streamIndex].Location.Rva = threadInfoListRva;
@@ -428,6 +456,9 @@ BOOL WriteMiniDumpInprocImpl(
     INPROC_EMIT_STREAM(moduleListRva, WriteModuleList(hFile, moduleCount, moduleListRva));
     INPROC_EMIT_STREAM(threadListRva, WriteThreadList(hFile, threadCount, threadContextsRva, \
         memoryBaseRva, writeSelectedMemory));
+    if (writeThreadNames) {
+        INPROC_EMIT_STREAM(threadNamesRva, WriteThreadNames(hFile, threadCount, threadNamesRva));
+    }
     if (writeThreadInfo) {
         INPROC_EMIT_STREAM(threadInfoListRva, WriteThreadInfoList(hFile, threadCount));
     }

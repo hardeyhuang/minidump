@@ -30,6 +30,15 @@ namespace minidump_inproc::internal {
 
 inline constexpr ULONG32 kMaxModules = 4096;
 inline constexpr ULONG32 kMaxThreads = 1024;
+// Per-thread captured name (WCHARs, excluding NUL) for ThreadNamesStream. Stored inline in the
+// immutable thread plan so the crash path needs no heap. Names longer than this are dropped (the
+// kernel query reports buffer-too-small) rather than partially captured.
+inline constexpr ULONG32 kMaxThreadNameChars = 64;
+// NtQueryInformationThread class for the kernel-stored thread name (ThreadNameInformation).
+inline constexpr ULONG kThreadNameInformation = 38;
+// MINIDUMP_STREAM_TYPE::ThreadNamesStream. Hardcoded so the build does not depend on the SDK
+// dbghelp.h being recent enough to define the enumerator.
+inline constexpr ULONG32 kThreadNamesStreamType = 24;
 // Maximum caller-provided user streams (MiniDumpWriteDump-style UserStreamParam) honored per dump.
 // Bounds the static plan array and the stream-directory slack so no heap is needed.
 inline constexpr ULONG32 kMaxUserStreams = 16;
@@ -273,6 +282,28 @@ struct INPROC_MEMORY_RANGE64 {
     ULONG64 Size;
 };
 
+// NtQueryInformationThread(ThreadNameInformation) result: a UNICODE_STRING whose Buffer points just
+// past this header inside the caller-provided buffer. No heap is involved; the kernel fills our
+// buffer directly, so it is safe to query on the crash path even for suspended threads.
+struct INPROC_THREAD_NAME_INFORMATION {
+    INPROC_UNICODE_STRING ThreadName;
+};
+
+// On-disk ThreadNamesStream layout. These mirror MINIDUMP_THREAD_NAME / MINIDUMP_THREAD_NAME_LIST
+// with their natural 8-byte alignment (RvaOfThreadName is a 64-bit absolute file offset to a
+// MINIDUMP_STRING). Defined locally so the build never depends on the SDK dbghelp.h version.
+struct INPROC_MINIDUMP_THREAD_NAME {
+    ULONG32 ThreadId;
+    ULONG32 Padding;
+    ULONG64 RvaOfThreadName;
+};
+struct INPROC_MINIDUMP_THREAD_NAME_LIST {
+    ULONG32 NumberOfThreadNames;
+    ULONG32 Padding;
+};
+static_assert(sizeof(INPROC_MINIDUMP_THREAD_NAME) == 16, "MINIDUMP_THREAD_NAME on-disk size must be 16");
+static_assert(sizeof(INPROC_MINIDUMP_THREAD_NAME_LIST) == 8, "MINIDUMP_THREAD_NAME_LIST header on-disk size must be 8");
+
 enum INPROC_STREAM_WRITE_RESULT {
     InprocStreamOk,
     InprocStreamSkip,
@@ -304,6 +335,8 @@ struct INPROC_THREAD_PLAN_ENTRY {
     ULONG64 UserTime;
     ULONG64 StartAddress;
     LONG Priority;
+    USHORT NameLength;                 // captured thread name length in WCHARs (excluding NUL); 0 if no name
+    WCHAR Name[kMaxThreadNameChars];   // captured under freeze; written to ThreadNamesStream
 };
 
 struct RTL_OSVERSIONINFOEXW_INPROC {
@@ -557,6 +590,15 @@ BOOL WriteThreadContexts(HANDLE hFile, ULONG32 threadCount, PMINIDUMP_EXCEPTION_
 
 // Writes ThreadInfoListStream from the NT thread snapshot instead of opening every thread for GetThreadTimes.
 BOOL WriteThreadInfoList(HANDLE hFile, ULONG32 threadCount) noexcept;
+
+// Counts threads that have a kernel-stored name and the total MINIDUMP_STRING storage their names
+// need, from the immutable thread plan captured under freeze.
+BOOL CountThreadNames(ULONG32 threadCount, ULONG32* nameCount, ULONG32* nameStorageBytes) noexcept;
+
+// Writes ThreadNamesStream (MINIDUMP_THREAD_NAME_LIST + entries) plus the trailing MINIDUMP_STRING
+// name blobs they reference. namesBaseRva is the stream's own RVA (each entry's RvaOfThreadName is
+// an absolute file offset into the trailing blobs). All data comes from the frozen thread plan.
+BOOL WriteThreadNames(HANDLE hFile, ULONG32 threadCount, ULONG64 namesBaseRva) noexcept;
 
 // Reads a thread stack range from its TEB, opening the thread only when it is not the current thread.
 BOOL QueryThreadStackRange(DWORD threadId, ULONG64* stackStart, ULONG32* stackSize) noexcept;

@@ -218,6 +218,48 @@ BOOL CountProcessThreads(DWORD preferredThreadId, ULONG32* threadCount, ULONG32*
 }
 
 
+// Captures a thread's kernel-stored name (set via SetThreadDescription) into its immutable plan
+// entry. Uses a small stack buffer and the pre-resolved NtQueryInformationThread -- no heap, no
+// loader lock, no LocalAlloc (unlike GetThreadDescription, which allocates a LocalFree'able buffer
+// and would risk the heap lock held by a frozen thread) -- so it is safe on the crash path. The
+// query targets the thread object, so it works on already-suspended threads. Names longer than
+// kMaxThreadNameChars are dropped rather than partially captured.
+static void CaptureThreadName(INPROC_THREAD_PLAN_ENTRY& entry) noexcept
+{
+    entry.NameLength = 0;
+
+    NtQueryInformationThreadFn queryThread = g_Apis.NtQueryInformationThread;
+    if (queryThread == nullptr) {
+        return;
+    }
+
+    HANDLE hThread = entry.IsCurrent ? GetCurrentThread() : entry.Handle;
+    if (hThread == nullptr) {
+        return;
+    }
+
+    BYTE buffer[sizeof(INPROC_THREAD_NAME_INFORMATION) + kMaxThreadNameChars * sizeof(WCHAR)] = {};
+    ULONG returnLength = 0;
+    if (!NT_SUCCESS(queryThread(hThread, kThreadNameInformation, buffer, sizeof(buffer), &returnLength))) {
+        return;
+    }
+
+    const INPROC_THREAD_NAME_INFORMATION* info = reinterpret_cast<const INPROC_THREAD_NAME_INFORMATION*>(buffer);
+    const WCHAR* name = info->ThreadName.Buffer;
+    ULONG32 chars = static_cast<ULONG32>(info->ThreadName.Length) / static_cast<ULONG32>(sizeof(WCHAR));
+    if (name == nullptr || chars == 0) {
+        return;
+    }
+    if (chars > kMaxThreadNameChars) {
+        chars = kMaxThreadNameChars;
+    }
+    for (ULONG32 i = 0; i < chars; ++i) {
+        entry.Name[i] = name[i];
+    }
+    entry.NameLength = static_cast<USHORT>(chars);
+}
+
+
 // Takes a single thread snapshot, opens+suspends every other thread, and records an immutable
 // per-thread plan so all later passes operate on identical, frozen data. Threads are opened
 // BEFORE any suspension to avoid needing the handle table lock while threads are frozen.
@@ -254,8 +296,11 @@ BOOL BuildThreadPlanAndFreeze(DWORD preferredThreadId) noexcept
             }
 
             if (!entry.IsCurrent) {
+                // THREAD_QUERY_LIMITED_INFORMATION is required by NtQueryInformationThread(
+                // ThreadNameInformation) to read the thread name; the others drive suspend/context.
                 entry.Handle = OpenThread(
-                    THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION,
+                    THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION |
+                        THREAD_QUERY_LIMITED_INFORMATION,
                     FALSE,
                     tid);
             }
@@ -322,7 +367,8 @@ BOOL BuildThreadPlanAndFreeze(DWORD preferredThreadId) noexcept
             g_ThreadPlan[slot].ThreadId = preferredThreadId;
             g_ThreadPlan[slot].IsCurrent = FALSE;
             g_ThreadPlan[slot].Handle = OpenThread(
-                THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION,
+                THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION |
+                    THREAD_QUERY_LIMITED_INFORMATION,
                 FALSE,
                 preferredThreadId);
         }
@@ -371,6 +417,9 @@ BOOL BuildThreadPlanAndFreeze(DWORD preferredThreadId) noexcept
         entry.AuxStackStart = 0;
         entry.AuxStackSize = 0;
 
+        // Capture the thread name now, while the handle is open and the thread is frozen, so the
+        // ThreadNamesStream stays consistent with every other plan-derived stream.
+        CaptureThreadName(entry);
 
         if (entry.ThreadId == preferredThreadId) {
             g_ExceptionThreadIndex = i;
@@ -598,6 +647,92 @@ BOOL WriteThreadInfoList(HANDLE hFile, ULONG32 threadCount) noexcept
         info.StartAddress = entry.StartAddress;
 
         if (!WriteAll(hFile, &info, sizeof(info))) {
+            return FALSE;
+        }
+    }
+
+    return TRUE;
+}
+
+
+// Counts threads with a captured name and the total MINIDUMP_STRING bytes their names occupy. Both
+// the layout pass and WriteThreadNames read the same frozen plan, so the counts always agree.
+
+BOOL CountThreadNames(ULONG32 threadCount, ULONG32* nameCount, ULONG32* nameStorageBytes) noexcept
+{
+    ULONG32 count = 0;
+    ULONG32 bytes = 0;
+
+    for (ULONG32 i = 0; i < threadCount && i < g_ThreadPlanCount; ++i) {
+        if (g_ThreadPlan[i].NameLength != 0) {
+            ++count;
+            bytes += MinidumpStringSize(static_cast<ULONG32>(g_ThreadPlan[i].NameLength) * static_cast<ULONG32>(sizeof(WCHAR)));
+        }
+    }
+
+    *nameCount = count;
+    *nameStorageBytes = bytes;
+    return TRUE;
+}
+
+
+// Writes ThreadNamesStream: the MINIDUMP_THREAD_NAME_LIST header, one MINIDUMP_THREAD_NAME entry per
+// named thread, then the referenced MINIDUMP_STRING name blobs laid out contiguously right after the
+// entry table. RvaOfThreadName is an absolute file offset, computed from namesBaseRva. All bytes come
+// from the frozen plan (already in our static memory), so this pass needs no SEH/heap and cannot fault.
+
+BOOL WriteThreadNames(HANDLE hFile, ULONG32 threadCount, ULONG64 namesBaseRva) noexcept
+{
+    ULONG32 nameCount = 0;
+    for (ULONG32 i = 0; i < threadCount && i < g_ThreadPlanCount; ++i) {
+        if (g_ThreadPlan[i].NameLength != 0) {
+            ++nameCount;
+        }
+    }
+
+    INPROC_MINIDUMP_THREAD_NAME_LIST listHeader = {};
+    listHeader.NumberOfThreadNames = nameCount;
+    if (!WriteAll(hFile, &listHeader, sizeof(listHeader))) {
+        return FALSE;
+    }
+
+    // The name blobs start immediately after the entry table; assign each entry's absolute RVA in the
+    // same plan order the blobs are written below.
+    ULONG64 stringRva = namesBaseRva + sizeof(INPROC_MINIDUMP_THREAD_NAME_LIST) +
+                        static_cast<ULONG64>(nameCount) * sizeof(INPROC_MINIDUMP_THREAD_NAME);
+    for (ULONG32 i = 0; i < threadCount && i < g_ThreadPlanCount; ++i) {
+        const INPROC_THREAD_PLAN_ENTRY& entry = g_ThreadPlan[i];
+        if (entry.NameLength == 0) {
+            continue;
+        }
+        INPROC_MINIDUMP_THREAD_NAME record = {};
+        record.ThreadId = entry.ThreadId;
+        record.RvaOfThreadName = stringRva;
+        if (!WriteAll(hFile, &record, sizeof(record))) {
+            return FALSE;
+        }
+        stringRva += MinidumpStringSize(static_cast<ULONG32>(entry.NameLength) * static_cast<ULONG32>(sizeof(WCHAR)));
+    }
+
+    // Name blobs as MINIDUMP_STRING (ULONG32 byte length + WCHARs + NUL + 4-byte padding).
+    for (ULONG32 i = 0; i < threadCount && i < g_ThreadPlanCount; ++i) {
+        const INPROC_THREAD_PLAN_ENTRY& entry = g_ThreadPlan[i];
+        if (entry.NameLength == 0) {
+            continue;
+        }
+        const ULONG32 lengthBytes = static_cast<ULONG32>(entry.NameLength) * static_cast<ULONG32>(sizeof(WCHAR));
+        const ULONG32 total = MinidumpStringSize(lengthBytes);
+        const WCHAR nul = 0;
+        if (!WriteAll(hFile, &lengthBytes, sizeof(lengthBytes))) {
+            return FALSE;
+        }
+        if (!WriteAll(hFile, entry.Name, lengthBytes)) {
+            return FALSE;
+        }
+        if (!WriteAll(hFile, &nul, sizeof(nul))) {
+            return FALSE;
+        }
+        if (!WriteZeros(hFile, total - sizeof(lengthBytes) - lengthBytes - sizeof(nul))) {
             return FALSE;
         }
     }
