@@ -269,22 +269,22 @@ BOOL VisitedPageSeenOrInsert(ULONG64 page) noexcept
 } // namespace
 
 
-// Validates a candidate pointer (cached VirtualQuery), normalizes it to a 4KB page, dedups via the
-// visited-page hash, rejects overlaps with already-planned ranges, and records it at the given BFS
-// layer. Returns FALSE only when the per-dump cap is reached (signals callers to stop).
+// Validates one already-page-aligned address, dedups via the visited-page hash, rejects overlaps
+// with already-planned ranges, and records it at the given BFS layer. Each page is classified
+// against its OWN VirtualQuery region (a straddle-neighbor page may live in a different, possibly
+// guard/uncommitted, region than the page that produced it). Returns FALSE only when the per-dump
+// cap is reached (signals callers to stop); a page that fails any gate is skipped with TRUE so
+// scanning continues.
 
-BOOL AddIndirectMemoryRangeFromPointer(ULONG64 value, ULONG64 sourceStart, ULONG64 sourceEnd, ULONG32 layer) noexcept
+static BOOL CollectIndirectPage(ULONG64 page, ULONG32 layer) noexcept
 {
     if (g_IndirectMemoryRangeCount >= g_IndirectMemoryRangeCap) {
         return FALSE;
     }
-    if (value < 0x10000ULL || (value >= sourceStart && value < sourceEnd)) {
-        return TRUE;
-    }
 
     ULONG64 regionStart = 0, regionEnd = 0;
     BOOL dumpable = FALSE, isImage = FALSE, writable = FALSE;
-    if (!ClassifyRegionCached(value, &regionStart, &regionEnd, &dumpable, &isImage, &writable)) {
+    if (!ClassifyRegionCached(page, &regionStart, &regionEnd, &dumpable, &isImage, &writable)) {
         return TRUE;
     }
     if (!dumpable) {
@@ -300,7 +300,6 @@ BOOL AddIndirectMemoryRangeFromPointer(ULONG64 value, ULONG64 sourceStart, ULONG
         return TRUE; // cache makes clustered code/reserved rejects O(1)
     }
 
-    ULONG64 page = AlignDown(value, kIndirectMemoryRangeSize);
     if (page < regionStart || page + kIndirectMemoryRangeSize > regionEnd) {
         return TRUE;
     }
@@ -319,6 +318,38 @@ BOOL AddIndirectMemoryRangeFromPointer(ULONG64 value, ULONG64 sourceStart, ULONG
     ranges[g_IndirectMemoryRangeCount].Size = kIndirectMemoryRangeSize;
     ranges[g_IndirectMemoryRangeCount].Layer = layer;
     ++g_IndirectMemoryRangeCount;
+    return g_IndirectMemoryRangeCount < g_IndirectMemoryRangeCap;
+}
+
+
+// Validates a candidate pointer, then collects the 4KB page it lands in -- plus the next higher page
+// when the pointer sits within kPointerStraddleWindow of the page end. Pointers reference object
+// starts and object bodies grow toward higher addresses, so an edge pointer usually targets a struct
+// that straddles into the next page; collecting that neighbor recovers both the truncated tail bytes
+// and the outgoing pointers inside it (keeping the BFS chain intact). Returns FALSE only when the
+// per-dump cap is reached (signals callers to stop).
+
+BOOL AddIndirectMemoryRangeFromPointer(ULONG64 value, ULONG64 sourceStart, ULONG64 sourceEnd, ULONG32 layer) noexcept
+{
+    if (g_IndirectMemoryRangeCount >= g_IndirectMemoryRangeCap) {
+        return FALSE;
+    }
+    if (value < 0x10000ULL || (value >= sourceStart && value < sourceEnd)) {
+        return TRUE;
+    }
+
+    // Window spans [value, value + kPointerStraddleWindow). Its end page equals the start page unless
+    // value is within the window of the page boundary, in which case exactly one extra (higher) page
+    // is added (kPointerStraddleWindow <= page size). Guard the (theoretical) address-space wraparound
+    // so an overflowing high pointer collapses to just its own page instead of skipping the loop.
+    ULONG64 firstPage = AlignDown(value, kIndirectMemoryRangeSize);
+    ULONG64 windowEnd = value + (kPointerStraddleWindow - 1);
+    ULONG64 lastPage = (windowEnd < value) ? firstPage : AlignDown(windowEnd, kIndirectMemoryRangeSize);
+    for (ULONG64 page = firstPage; page <= lastPage; page += kIndirectMemoryRangeSize) {
+        if (!CollectIndirectPage(page, layer)) {
+            return FALSE;
+        }
+    }
     return g_IndirectMemoryRangeCount < g_IndirectMemoryRangeCap;
 }
 

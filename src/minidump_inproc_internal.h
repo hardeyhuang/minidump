@@ -37,6 +37,15 @@ inline constexpr ULONG32 kMaxModuleNameBytes = 32766;
 inline constexpr ULONG32 kMaxCodeViewRecordBytes = 4096;
 inline constexpr ULONG32 kCodeViewSignatureRsds = 0x53445352;
 inline constexpr ULONG32 kIndirectMemoryRangeSize = 4096;
+// Pointers reference object *starts*, and object bodies grow toward higher addresses, so a pointer
+// landing near the top of its 4KB page usually points to a struct that straddles into the next page.
+// Capturing only AlignDown(value) would then truncate the object AND drop the outgoing pointers in
+// its tail half (breaking the BFS chain). When the pointer is within this many bytes of the page end
+// we also collect the next higher page. Kept small (one extra page at most, since it is <= the page
+// size) so the file-size budget is not doubled: only the ~window/4096 fraction of edge pointers pay.
+inline constexpr ULONG32 kPointerStraddleWindow = 512;
+static_assert(kPointerStraddleWindow <= kIndirectMemoryRangeSize,
+              "straddle window must stay within one page so at most one neighbor page is added");
 // Memory byte-streaming block size. WriteRegionBytes probes and writes a whole block in one
 // WriteFile on the common all-readable path (instead of one WriteFile per 4 KB page), only dropping
 // to page granularity to isolate and zero-fill faulting pages. This cuts syscalls by ~256x for large
