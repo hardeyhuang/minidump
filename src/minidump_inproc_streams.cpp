@@ -58,50 +58,6 @@ BOOL WriteMiscInfo(HANDLE hFile) noexcept
 
 namespace {
 
-// Minimal, heap-free ASCII formatting helpers for the comment stream. All append at `pos`, never
-// overflow `cap`, and always leave room for a later NUL terminator (pos + 1 < cap).
-ULONG32 CommentAppendStr(char* buf, ULONG32 cap, ULONG32 pos, const char* text) noexcept
-{
-    while (text != nullptr && *text != '\0' && pos + 1 < cap) {
-        buf[pos++] = *text++;
-    }
-    return pos;
-}
-
-ULONG32 CommentAppendU64(char* buf, ULONG32 cap, ULONG32 pos, ULONG64 value) noexcept
-{
-    char digits[24];
-    ULONG32 count = 0;
-    if (value == 0) {
-        digits[count++] = '0';
-    }
-    while (value != 0 && count < sizeof(digits)) {
-        digits[count++] = static_cast<char>('0' + static_cast<int>(value % 10));
-        value /= 10;
-    }
-    while (count != 0 && pos + 1 < cap) {
-        buf[pos++] = digits[--count];
-    }
-    return pos;
-}
-
-// Appends a byte count rendered in whole megabytes, e.g. "4096MB".
-ULONG32 CommentAppendMB(char* buf, ULONG32 cap, ULONG32 pos, ULONG64 bytes) noexcept
-{
-    pos = CommentAppendU64(buf, cap, pos, bytes >> 20);
-    pos = CommentAppendStr(buf, cap, pos, "MB");
-    return pos;
-}
-
-// Appends a byte count rendered in whole kilobytes, e.g. "512KB". Used for kernel-pool quotas,
-// which are typically KB-to-a-few-MB and would round to 0 under megabyte granularity.
-ULONG32 CommentAppendKB(char* buf, ULONG32 cap, ULONG32 pos, ULONG64 bytes) noexcept
-{
-    pos = CommentAppendU64(buf, cap, pos, bytes >> 10);
-    pos = CommentAppendStr(buf, cap, pos, "KB");
-    return pos;
-}
-
 BOOL QuerySystemMemory(MEMORYSTATUSEX* status) noexcept
 {
     status->dwLength = sizeof(*status);
@@ -198,6 +154,299 @@ BOOL QueryGuiResources(ULONG* gdiObjects, ULONG* userObjects) noexcept
         return FALSE;
     }
 #endif
+}
+
+// ---- CommentStreamA buffer helpers --------------------------------------------------------
+// Minimal, heap-free ASCII formatting helpers for the comment stream. All append at `pos`, never
+// overflow `cap`, and always leave room for a later NUL terminator (pos + 1 < cap).
+ULONG32 CommentAppendStr(char* buf, ULONG32 cap, ULONG32 pos, const char* text) noexcept
+{
+    while (text != nullptr && *text != '\0' && pos + 1 < cap) {
+        buf[pos++] = *text++;
+    }
+    return pos;
+}
+
+ULONG32 CommentAppendU64(char* buf, ULONG32 cap, ULONG32 pos, ULONG64 value) noexcept
+{
+    char digits[24];
+    ULONG32 count = 0;
+    if (value == 0) {
+        digits[count++] = '0';
+    }
+    while (value != 0 && count < sizeof(digits)) {
+        digits[count++] = static_cast<char>('0' + static_cast<int>(value % 10));
+        value /= 10;
+    }
+    while (count != 0 && pos + 1 < cap) {
+        buf[pos++] = digits[--count];
+    }
+    return pos;
+}
+
+// Appends a byte count rendered in whole megabytes, e.g. "4096MB".
+ULONG32 CommentAppendMB(char* buf, ULONG32 cap, ULONG32 pos, ULONG64 bytes) noexcept
+{
+    pos = CommentAppendU64(buf, cap, pos, bytes >> 20);
+    pos = CommentAppendStr(buf, cap, pos, "MB");
+    return pos;
+}
+
+// Appends a byte count rendered in whole kilobytes, e.g. "512KB". Used for kernel-pool quotas,
+// which are typically KB-to-a-few-MB and would round to 0 under megabyte granularity.
+ULONG32 CommentAppendKB(char* buf, ULONG32 cap, ULONG32 pos, ULONG64 bytes) noexcept
+{
+    pos = CommentAppendU64(buf, cap, pos, bytes >> 10);
+    pos = CommentAppendStr(buf, cap, pos, "KB");
+    return pos;
+}
+
+// ---- CommentStreamW INI buffer helpers --------------------------------------------------------
+// The user comment is kept as a flat, NUL-terminated wide INI text in g_CommentBufferW, e.g.
+//   [Section]\nKey1=Value1\nKey2=Value2\n[Other]\nKeyA=ValueA\n
+// All edits are performed in place under g_CommentLock; no heap is used.
+
+// Wide string length without depending on the CRT (also keeps the crash path self-contained).
+ULONG32 CommentWStrLen(const wchar_t* s) noexcept
+{
+    ULONG32 n = 0;
+    while (s[n] != L'\0') {
+        ++n;
+    }
+    return n;
+}
+
+// Exact n-WCHAR comparison.
+BOOL CommentWRangeEqual(const wchar_t* a, const wchar_t* b, ULONG32 n) noexcept
+{
+    for (ULONG32 i = 0; i < n; ++i) {
+        if (a[i] != b[i]) {
+            return FALSE;
+        }
+    }
+    return TRUE;
+}
+
+// Replaces g_CommentBufferW[at, at+removeLen) with `insLen` WCHARs from `ins`, keeping the buffer
+// NUL-terminated. Returns FALSE (leaving the buffer unchanged) if the result would not fit.
+BOOL CommentSplice(ULONG32 at, ULONG32 removeLen, const wchar_t* ins, ULONG32 insLen) noexcept
+{
+    const ULONG32 len = g_CommentWChars;
+    const ULONG32 newLen = len - removeLen + insLen;
+    if (newLen + 1u > kCommentBufferWChars) {
+        return FALSE; // no room for the content + terminating NUL
+    }
+    wchar_t* buf = g_CommentBufferW;
+    const ULONG32 tailStart = at + removeLen;
+    const ULONG32 tailLen = len - tailStart;
+    if (tailLen != 0 && insLen != removeLen) {
+        MoveMemory(buf + at + insLen, buf + tailStart, tailLen * sizeof(wchar_t));
+    }
+    for (ULONG32 i = 0; i < insLen; ++i) {
+        buf[at + i] = ins[i];
+    }
+    g_CommentWChars = newLen;
+    buf[newLen] = L'\0';
+    return TRUE;
+}
+
+// Normalizes a user value into `dst` for flat-INI storage and returns the number of WCHARs written
+// (never more than kCommentMaxValueChars). Drops '\r', maps each '\n' to U+21B5 (a visible return
+// arrow) and each ';' to the full-width '；' (U+FF1B) so stored values never collide with the ';'
+// token separator MERGE/APPEND rely on. Every surviving source char maps to exactly one WCHAR, so
+// callers can size buffers by kCommentMaxValueChars. `dst` is NOT NUL-terminated by this helper.
+ULONG32 CommentNormalizeValue(wchar_t* dst, const wchar_t* src) noexcept
+{
+    const wchar_t kFullWidthSemicolon = static_cast<wchar_t>(0xFF1B);
+    const wchar_t kReturnArrow = static_cast<wchar_t>(0x21B5);
+    ULONG32 t = 0;
+    for (ULONG32 i = 0; i < kCommentMaxValueChars && src[i] != L'\0'; ++i) {
+        const wchar_t c = src[i];
+        if (c == L'\r') {
+            continue;
+        }
+        if (c == L'\n') {
+            dst[t++] = kReturnArrow;
+        } else if (c == L';') {
+            dst[t++] = kFullWidthSemicolon;
+        } else {
+            dst[t++] = c;
+        }
+    }
+    return t;
+}
+
+// Core in-place INI mutation. Pointers are dereferenced here (the caller wraps this in SEH).
+BOOL CommentIniApply(const wchar_t* section, const wchar_t* key, const wchar_t* value,
+                     COMMENT_STRING_OPER_TYPE oper) noexcept
+{
+    const ULONG32 secLen = CommentWStrLen(section);
+    const ULONG32 keyLen = CommentWStrLen(key);
+    if (secLen == 0 || keyLen == 0) {
+        return FALSE;
+    }
+    // Reject over-long identifiers outright (no truncation for section/key).
+    if (secLen > kCommentMaxSectionKeyChars || keyLen > kCommentMaxSectionKeyChars) {
+        return FALSE;
+    }
+    const BOOL hasValue = (value != nullptr);
+
+    // Single small scratch buffer reused by every branch that needs to build text before handing it
+    // to CommentSplice. Sized to the largest fragment (kCommentMaxFragmentWChars), so this function's
+    // stack frame stays under 1KB. The user value is normalized straight into this buffer on demand
+    // (CommentNormalizeValue) at the exact slot each branch needs, so no separate value buffer is
+    // required. `value` keeps pointing at the raw caller string throughout.
+    wchar_t frag[kCommentMaxFragmentWChars];
+
+    wchar_t* buf = g_CommentBufferW;
+    const ULONG32 len = g_CommentWChars;
+
+    // Locate the section header line "[section]" and the byte span of its body.
+    BOOL secFound = FALSE;
+    ULONG32 bodyStart = 0, bodyEnd = len;
+    {
+        ULONG32 p = 0;
+        while (p < len) {
+            const ULONG32 ls = p;
+            ULONG32 nl = ls;
+            while (nl < len && buf[nl] != L'\n') {
+                ++nl;
+            }
+            const ULONG32 lineLen = nl - ls;
+            const BOOL isHeader = (lineLen >= 2 && buf[ls] == L'[' && buf[nl - 1] == L']');
+            if (isHeader) {
+                if (!secFound) {
+                    const ULONG32 nameLen = lineLen - 2;
+                    if (nameLen == secLen && CommentWRangeEqual(buf + ls + 1, section, secLen)) {
+                        secFound = TRUE;
+                        bodyStart = (nl < len) ? nl + 1 : len;
+                        bodyEnd = len;
+                    }
+                } else {
+                    bodyEnd = ls; // next section header ends the body
+                    break;
+                }
+            }
+            p = (nl < len) ? nl + 1 : len;
+        }
+    }
+
+    // Section absent: a NULL value (delete / no-op) changes nothing; otherwise append a new section.
+    if (!secFound) {
+        if (!hasValue) {
+            return TRUE;
+        }
+        ULONG32 t = 0;
+        frag[t++] = L'[';
+        for (ULONG32 i = 0; i < secLen; ++i) frag[t++] = section[i];
+        frag[t++] = L']';
+        frag[t++] = L'\n';
+        for (ULONG32 i = 0; i < keyLen; ++i) frag[t++] = key[i];
+        frag[t++] = L'=';
+        t += CommentNormalizeValue(frag + t, value);
+        frag[t++] = L'\n';
+        return CommentSplice(len, 0, frag, t);
+    }
+
+    // Locate "key=" within the section body; remember the value span [valStart, valEnd).
+    BOOL keyFound = FALSE;
+    ULONG32 keyLineStart = 0, valStart = 0, valEnd = 0;
+    {
+        ULONG32 q = bodyStart;
+        while (q < bodyEnd) {
+            const ULONG32 ls = q;
+            ULONG32 nl = ls;
+            while (nl < bodyEnd && buf[nl] != L'\n') {
+                ++nl;
+            }
+            ULONG32 eq = ls;
+            while (eq < nl && buf[eq] != L'=') {
+                ++eq;
+            }
+            if (eq < nl) {
+                const ULONG32 klen = eq - ls;
+                if (klen == keyLen && CommentWRangeEqual(buf + ls, key, keyLen)) {
+                    keyFound = TRUE;
+                    keyLineStart = ls;
+                    valStart = eq + 1;
+                    valEnd = nl;
+                    break;
+                }
+            }
+            q = (nl < bodyEnd) ? nl + 1 : bodyEnd;
+        }
+    }
+
+    // Key absent: a NULL value is a no-op; otherwise insert "key=value\n" at the end of the section.
+    if (!keyFound) {
+        if (!hasValue) {
+            return TRUE;
+        }
+        ULONG32 t = 0;
+        for (ULONG32 i = 0; i < keyLen; ++i) frag[t++] = key[i];
+        frag[t++] = L'=';
+        t += CommentNormalizeValue(frag + t, value);
+        frag[t++] = L'\n';
+        return CommentSplice(bodyEnd, 0, frag, t);
+    }
+
+    // Key present: apply the requested operation to its value.
+    switch (oper) {
+        case CommentStringReplace: {
+            if (!hasValue) {
+                // Delete the whole key line, including its trailing newline.
+                ULONG32 removeEnd = valEnd;
+                if (removeEnd < len && buf[removeEnd] == L'\n') {
+                    ++removeEnd;
+                }
+                return CommentSplice(keyLineStart, removeEnd - keyLineStart, nullptr, 0);
+            }
+            const ULONG32 valLen = CommentNormalizeValue(frag, value);
+            return CommentSplice(valStart, valEnd - valStart, frag, valLen);
+        }
+        case CommentStringAppend: {
+            if (!hasValue) {
+                return TRUE;
+            }
+            // Reserve frag[0] for the ';' separator and normalize the value right after it.
+            frag[0] = L';';
+            const ULONG32 valLen = CommentNormalizeValue(frag + 1, value);
+            return CommentSplice(valEnd, 0, frag, valLen + 1u);
+        }
+        case CommentStringMerge: {
+            if (!hasValue) {
+                return TRUE;
+            }
+            // Normalize the new value into frag+1, reserving frag[0] for a possible ';' separator so
+            // the same buffer serves both the dedup comparison and the eventual splice.
+            frag[0] = L';';
+            const wchar_t* const val = frag + 1;
+            const ULONG32 valLen = CommentNormalizeValue(frag + 1, value);
+            // Empty current value: just set it (avoids producing a leading ';').
+            if (valEnd == valStart) {
+                return CommentSplice(valStart, 0, val, valLen);
+            }
+            // Deduplicate: scan the existing ';'-separated tokens for an exact match.
+            ULONG32 s = valStart;
+            while (s <= valEnd) {
+                ULONG32 e = s;
+                while (e < valEnd && buf[e] != L';') {
+                    ++e;
+                }
+                const ULONG32 tokLen = e - s;
+                if (tokLen == valLen && CommentWRangeEqual(buf + s, val, valLen)) {
+                    return TRUE; // already present, leave unchanged
+                }
+                if (e >= valEnd) {
+                    break;
+                }
+                s = e + 1;
+            }
+            return CommentSplice(valEnd, 0, frag, valLen + 1u);
+        }
+        default:
+            return FALSE;
+    }
 }
 
 } // namespace
@@ -381,6 +630,77 @@ INPROC_STREAM_WRITE_RESULT WriteCommentStream(HANDLE hFile, ULONG32 byteLen) noe
         byteLen = kCommentBufferBytes;
     }
     return StreamResultFromBool(WriteAll(hFile, g_CommentBuffer, byteLen));
+}
+
+
+// Applies one user (section, key, value) operation to the persistent CommentStreamW INI buffer.
+// Serialized via g_CommentLock and SEH-guarded so a bad caller pointer cannot crash the process.
+
+BOOL SetCommentIniW(const wchar_t* section, const wchar_t* key, const wchar_t* value,
+                    COMMENT_STRING_OPER_TYPE oper) noexcept
+{
+    if (section == nullptr || key == nullptr) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+
+    // Lightweight spin lock: serializes concurrent setters. (Not intended to be held against an
+    // in-progress dump; see the public header note.)
+    while (InterlockedExchange(&g_CommentLock, 1) != 0) {
+        YieldProcessor();
+    }
+
+    BOOL ok;
+#if defined(_MSC_VER)
+    __try {
+        ok = CommentIniApply(section, key, value, oper);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        ok = FALSE;
+    }
+#else
+    ok = CommentIniApply(section, key, value, oper);
+#endif
+
+    InterlockedExchange(&g_CommentLock, 0);
+    if (!ok) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+    }
+    return ok;
+}
+
+
+// Returns the 4-byte-aligned on-disk byte size of CommentStreamW (wide text + NUL), or 0 if unset.
+
+ULONG32 CommentStreamWBytes() noexcept
+{
+    if (g_CommentWChars == 0) {
+        return 0;
+    }
+    const ULONG64 bytes = (static_cast<ULONG64>(g_CommentWChars) + 1) * sizeof(WCHAR);
+    return static_cast<ULONG32>(Align4(bytes));
+}
+
+
+// Writes the prebuilt CommentStreamW bytes (wide INI text + NUL), zero-filling any alignment slack.
+
+INPROC_STREAM_WRITE_RESULT WriteCommentStreamW(HANDLE hFile, ULONG32 byteLen) noexcept
+{
+    if (byteLen == 0) {
+        return InprocStreamSkip;
+    }
+    ULONG32 contentBytes = (g_CommentWChars + 1u) * static_cast<ULONG32>(sizeof(WCHAR));
+    if (contentBytes > byteLen) {
+        contentBytes = byteLen;
+    }
+    if (!WriteAll(hFile, g_CommentBufferW, contentBytes)) {
+        return InprocStreamIoFailed;
+    }
+    if (byteLen > contentBytes) {
+        if (!WriteZeros(hFile, byteLen - contentBytes)) {
+            return InprocStreamIoFailed;
+        }
+    }
+    return InprocStreamOk;
 }
 
 

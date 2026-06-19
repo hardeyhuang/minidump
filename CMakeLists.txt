@@ -54,6 +54,12 @@ if(MINIDUMP_INPROC_BUILD_SAMPLE)
     add_executable(MiniDumpInprocStressTest examples/inproc_stress_test.cpp)
     target_link_libraries(MiniDumpInprocStressTest PRIVATE MiniDumpInproc)
 
+    # Behavioral test for the SetMiniDumpInprocComment A/W setters. It links the static library and
+    # inspects the internal comment buffer directly, so it needs the private src/ include directory.
+    add_executable(MiniDumpCommentApiTest examples/comment_api_test.cpp)
+    target_link_libraries(MiniDumpCommentApiTest PRIVATE MiniDumpInproc)
+    target_include_directories(MiniDumpCommentApiTest PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+
     add_executable(Ue4LikeLargeAppCrash examples/ue4_like_large_app_crash.cpp)
     target_link_libraries(Ue4LikeLargeAppCrash PRIVATE MiniDumpInproc)
 
@@ -72,6 +78,8 @@ if(MINIDUMP_INPROC_BUILD_SAMPLE)
         # notice is expected and harmless for this demo target only).
         target_compile_options(MiniDumpInprocStressTest PRIVATE /W4 /permissive- /Od /Ob0 /Oy-)
         set_target_properties(MiniDumpInprocStressTest PROPERTIES LINK_FLAGS "/ENTRY:wmainCRTStartup")
+        target_compile_options(MiniDumpCommentApiTest PRIVATE /W4 /permissive-)
+        set_target_properties(MiniDumpCommentApiTest PROPERTIES LINK_FLAGS "/ENTRY:wmainCRTStartup")
         target_compile_options(MiniDumpInspect PRIVATE /W4 /permissive-)
         set_target_properties(MiniDumpInspect PROPERTIES LINK_FLAGS "/ENTRY:wmainCRTStartup")
         # Disable optimization for the overflow recursion so the stack actually grows (the recursive

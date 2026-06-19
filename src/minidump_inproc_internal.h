@@ -11,6 +11,8 @@
 #include <dbghelp.h>
 #include <intrin.h>
 
+#include "minidump_inproc.h"
+
 
 #pragma intrinsic(memset)
 #if defined(_M_X64)
@@ -86,6 +88,26 @@ inline constexpr ULONG32 kCommentBufferBytes = 1024;
 inline constexpr ULONG32 kCommentElapsedWidth = 10;
 // Sentinel meaning "no elapsed field was reserved" (e.g. the buffer was too full to fit it).
 inline constexpr ULONG32 kCommentElapsedUnset = 0xFFFFFFFFu;
+// Wide CommentStreamW buffer capacity (in WCHARs, including the terminating NUL). Holds the
+// user-supplied INI-style (section/key/value) comment text accumulated by SetMiniDumpInprocComment*.
+inline constexpr ULONG32 kCommentBufferWChars = 4096;
+// Maximum characters accepted for a SetMiniDumpInprocComment* section or key. A longer section/key
+// fails the call (returns FALSE) rather than being silently truncated.
+inline constexpr ULONG32 kCommentMaxSectionKeyChars = 64;
+// Maximum source characters kept from a SetMiniDumpInprocComment* value; anything beyond this is
+// truncated. After truncation the kept characters are escaped for INI safety: each newline becomes a
+// single '$' and each ';' becomes the full-width '；' (U+FF1B). Both substitutions are 1:1, so the
+// stored value is at most kCommentMaxValueChars WCHARs.
+inline constexpr ULONG32 kCommentMaxValueChars = 256;
+// Worst-case stored (escaped) value length in WCHARs. Every escape is 1:1, so this equals the source
+// cap; kept as a named alias so buffer sizing reads clearly and survives future escape-rule changes.
+inline constexpr ULONG32 kCommentMaxStoredValueWChars = kCommentMaxValueChars;
+// Upper bound (in WCHARs) on the largest INI fragment CommentIniApply ever assembles before handing
+// it to CommentSplice. The biggest case is the "section absent" append: '[' + section + ']' + '\n' +
+// key + '=' + value + '\n'. Bounding the scratch buffer by this instead of kCommentBufferWChars keeps
+// the function's stack frame small.
+inline constexpr ULONG32 kCommentMaxFragmentWChars =
+    1 + kCommentMaxSectionKeyChars + 1 + 1 + kCommentMaxSectionKeyChars + 1 + kCommentMaxStoredValueWChars + 1;
 
 // One shared scratch buffer is reused across non-overlapping phases to keep the static
 // footprint small: first as the NtQuerySystemInformation process snapshot (consumed entirely
@@ -384,6 +406,12 @@ extern char g_CommentBuffer[kCommentBufferBytes];
 extern ULONG32 g_CommentBytes;
 // Byte offset of the reserved elapsed-time digit field inside g_CommentBuffer, or kCommentElapsedUnset.
 extern ULONG32 g_CommentElapsedOffset;
+// User-supplied CommentStreamW text (INI-style sections/keys) and its current length in WCHARs
+// (excluding the terminating NUL). Populated incrementally by SetMiniDumpInprocComment* and persists
+// for the process lifetime so every dump includes it. g_CommentLock serializes concurrent setters.
+extern WCHAR g_CommentBufferW[kCommentBufferWChars];
+extern ULONG32 g_CommentWChars;
+extern volatile LONG g_CommentLock;
 extern ULONG32 g_IndirectMemoryRangeCount;
 extern INPROC_MEMORY_RANGE g_KnownMemoryRanges[kMaxKnownMemoryRanges];
 extern ULONG32 g_KnownMemoryRangeCount;
@@ -722,6 +750,21 @@ BOOL WriteUserStreams(HANDLE hFile, ULONG32 count) noexcept;
 // Writes CommentStreamA from g_CommentBuffer. byteLen must equal the value returned by
 // BuildMemoryCommentText (the size reserved in the stream directory).
 INPROC_STREAM_WRITE_RESULT WriteCommentStream(HANDLE hFile, ULONG32 byteLen) noexcept;
+
+// Applies one user (section, key, value) operation to the persistent CommentStreamW INI buffer
+// (g_CommentBufferW). Validates inputs, takes g_CommentLock, and is SEH-guarded against bad caller
+// pointers. Returns FALSE on invalid input or when the result would not fit the fixed buffer. This is
+// the shared worker behind the exported SetMiniDumpInprocCommentA/W wrappers.
+BOOL SetCommentIniW(const wchar_t* section, const wchar_t* key, const wchar_t* value,
+                    COMMENT_STRING_OPER_TYPE oper) noexcept;
+
+// Returns the 4-byte-aligned on-disk byte size of CommentStreamW (the wide INI text in
+// g_CommentBufferW including its terminating NUL), or 0 when no user comment has been set.
+ULONG32 CommentStreamWBytes() noexcept;
+
+// Writes CommentStreamW from g_CommentBufferW. byteLen must equal the value returned by
+// CommentStreamWBytes (the size reserved in the stream directory); any alignment slack is zero-filled.
+INPROC_STREAM_WRITE_RESULT WriteCommentStreamW(HANDLE hFile, ULONG32 byteLen) noexcept;
 
 
 

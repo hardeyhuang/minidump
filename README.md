@@ -49,7 +49,7 @@ BOOL WriteMiniDumpInproc(
 
 ### 支持的 `MINIDUMP_TYPE` 标志与支持程度
 
-固定写入（与标志无关，始终产出）：`SystemInfoStream`、`MiscInfoStream`、`CommentStreamA`、`ModuleListStream`、`ThreadListStream` + 全部线程 `CONTEXT`；传入异常信息时附带 `ExceptionStream`。
+固定写入（与标志无关，始终产出）：`SystemInfoStream`、`MiscInfoStream`、`CommentStreamA`、`ModuleListStream`、`ThreadListStream` + 全部线程 `CONTEXT`；传入异常信息时附带 `ExceptionStream`。另：当通过 `SetMiniDumpInprocComment*` 设置过用户注释时，附带 `CommentStreamW`（见下）。
 
 > **`CommentStreamA`（系统/进程内存与资源摘要）**：始终写入一段 ANSI 文本（四行），记录崩溃时的关键内存与资源指标，方便后续定位 OOM / 内存泄漏 / 句柄泄漏 / GDI-USER 泄漏 / 内核池泄漏，并附本次写 dump 的总耗时。**WinDbg 打开 dump 时会自动显示该 Comment**，无需额外命令；`MiniDumpInspect` 也会打印其文本。取值全程**零堆分配**、SEH 保护，查询失败则记为 `unavailable` / `n/a` 而不影响 dump。示例：
 >
@@ -66,6 +66,25 @@ BOOL WriteMiniDumpInproc(
 > - **`ProcMem`** ← 预解析 `NtQueryInformationProcess(ProcessVmCounters → VM_COUNTERS_EX)`：`WorkingSet`/`PeakWorkingSet`、`PrivateCommit`（私有提交 = Private Bytes）/`PeakCommit`（峰值提交）、`VirtSize`/`PeakVirtSize`（虚拟大小及峰值）、`PageFaults`（缺页次数）。
 > - **`ProcRes`** ← 内核池配额（同上 `VM_COUNTERS_EX`）+ 句柄数 + GDI/USER 对象数：`PagedPool`/`NonPagedPool`（及各自峰值，KB 粒度）反映内核对象占用的两类内核池；`Handles`/`PeakHandles` ← `NtQueryInformationProcess(ProcessHandleCount)`，峰值用于句柄泄漏定位；`GDI`/`USER` ← `user32!GetGuiResources`。
 > - **`ProcTime`** ← `QueryPerformanceCounter`：`Elapsed`=本次 `WriteMiniDumpInproc` 的总耗时（微秒，右对齐定宽字段）。该字段在布局阶段以占位形式预留，并在**所有其它 stream 写完之后**回填真实耗时，因此 `CommentStreamA` 被**最后写入**（写入器用绝对 RVA seek，stream 物理顺序与写入顺序解耦），使耗时几乎覆盖整个 dump 过程，便于评估崩溃路径性能。
+>
+> **`CommentStreamW`（用户自定义注释，INI 形式）**：除自动摘要外，可在崩溃前通过两个导出函数附加任意诊断上下文，最终都写入同一个 **`CommentStreamW`**（宽字符流，WinDbg 打开时同样自动显示）：
+>
+> ```c
+> typedef enum _COMMENT_STRING_OPER_TYPE {
+>     CommentStringReplace = 0, // upsert 覆盖；value=NULL 时删除该 key 整行
+>     CommentStringMerge   = 1, // 按 ';' token 去重追加（已存在则不变）；value=NULL 为空操作
+>     CommentStringAppend  = 2, // 无条件 ';' 拼接（允许重复）；value=NULL 为空操作
+> } COMMENT_STRING_OPER_TYPE;
+>
+> BOOL SetMiniDumpInprocCommentA(const char*    section, const char*    key, const char*    value, COMMENT_STRING_OPER_TYPE oper);
+> BOOL SetMiniDumpInprocCommentW(const wchar_t* section, const wchar_t* key, const wchar_t* value, COMMENT_STRING_OPER_TYPE oper);
+> ```
+>
+> - **A/W 统一落点**：`A` 版本按当前 ANSI 代码页（`CP_ACP`）将入参转为 UTF-16 后转交 `W` 版本，二者数据都进同一个 `CommentStreamW`；自动内存摘要仍走独立的 `CommentStreamA`，互不干扰。
+> - **INI 文本累积**：内部用一块固定宽字符缓冲（`kCommentBufferWChars`，默认 4096 WCHAR）保存形如 `[Section]\nKey=Value\n…` 的 INI 文本，进程生命周期内持续累积，可分多次增量设置，并被之后的**每一次** dump 包含。
+> - **操作语义**（针对单个 `Key`）：`REPLACE` 存在即覆盖、否则新增（`value=NULL` 删除该行）；`MERGE` 把旧值视作 `;` 分隔的 token 列表，新值不在其中才追加（去重）；`APPEND` 无条件用 `;` 追加（可重复）。`MERGE`/`APPEND` 传 `NULL` 为空操作。
+> - **入参大小限制与归一化**：`section`/`key` 字符数上限 **64**，超过直接返回 `FALSE`（不截断）；`value` 字符数上限 **256**，超过**截断**。归一化后的 `value` 中，每个换行符替换为单个 `$`，每个 `;` 替换为全角 `；`（U+FF1B）；两种替换均为 1:1，存储后长度不超过 256 WCHAR，从而保证值始终位于单个 INI 行内，且不会与 `MERGE`/`APPEND` 使用的 `;` token 分隔符冲突。
+> - **入参校验与鲁棒**：`section`/`key` 必须非空，否则返回 `FALSE`；缓冲放不下结果也返回 `FALSE`。并发 setter 用轻量自旋锁串行化，且对调用方指针做 SEH 保护。与本库其余部分一致，这些 setter 设计为**崩溃前**调用，不保证与正在进行的 `WriteMiniDumpInproc` 并发安全。
 >
 > 关于 `GDI`/`USER`：仅当进程**已加载 user32** 时采集——库在加载期用 `GetModuleHandleW`（**绝不** `LoadLibrary`）条件解析 `GetGuiResources` 指针，因此**不会给控制台/服务进程强加 user32 依赖**；非 GUI 进程显示 `GDI=n/a USER=n/a`。该调用跨入 win32k 子系统、有 SEH 保护，且在冻结其它线程**之前**采集以规避 GUI 锁死锁。`GetGuiResources` 自身**不做用户态堆分配**（由 `GdiUserHandleAllocTrace` demo 实测验证，见下"构建"），符合崩溃路径无堆分配的约束。
 
@@ -174,6 +193,7 @@ BOOL WriteMiniDumpInproc(
 | `g_KnownMemoryRanges[kMaxThreads+4096]` | 5120 × 16 B ≈ **80 KB** | 已规划区域表（栈/数据段），供间接扫描去重判重叠 |
 | `g_ContextScratch` | `sizeof(CONTEXT)` ≈ **1.2 KB** | 取单个线程寄存器上下文的临时区 |
 | `g_CommentBuffer` | **1 KB** | `CommentStreamA` 的系统/进程内存摘要 ANSI 文本 |
+| `g_CommentBufferW` | **8 KB** | `CommentStreamW` 的用户自定义 INI 注释宽字符文本（4096 WCHAR） |
 | 其余计数器/标志/API 表 | < 1 KB | — |
 | **合计** | **≈ 4.3 MB** | 全部为 demand-zero，仅实际触达的页才占物理内存 |
 

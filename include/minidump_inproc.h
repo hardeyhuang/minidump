@@ -80,6 +80,57 @@ MINIDUMP_INPROC_API BOOL WINAPI WriteMiniDumpInproc(
 MINIDUMP_INPROC_API void WINAPI ResolveInprocApis(void) MINIDUMP_INPROC_NOEXCEPT;
 
 
+// Operation applied by SetMiniDumpInprocComment* to a single (section, key) entry.
+typedef enum _COMMENT_STRING_OPER_TYPE {
+    // Upsert overwrite: if the key already exists in the section its value is replaced, otherwise the
+    // key is added. As a special case, a NULL value DELETES the key (its whole line is removed); a
+    // missing key with a NULL value is a no-op. This is the default operation.
+    CommentStringReplace = 0,
+    // Deduplicating append: the existing value is treated as a ';'-separated token list. If the new
+    // value is not already one of those tokens it is appended after a ';', otherwise the value is left
+    // unchanged. A missing key is added. A NULL value is a no-op.
+    CommentStringMerge = 1,
+    // Unconditional append: the new value is appended to the existing value after a ';' even if it is
+    // already present (duplicates are allowed). A missing key is added. A NULL value is a no-op.
+    CommentStringAppend = 2,
+} COMMENT_STRING_OPER_TYPE;
+
+// Records a user-defined (section, key, value) entry into the dump's CommentStreamW (a WinDbg-visible
+// wide-character comment). Both the ANSI (A) and wide (W) variants ultimately store their data in the
+// SAME CommentStreamW: the A variant converts its inputs from the active ANSI code page (CP_ACP) to
+// UTF-16 first. This is independent of the automatic system/process memory summary, which continues to
+// be written to CommentStreamA.
+//
+// The accumulated comment is kept in a fixed internal INI-style buffer that persists for the process
+// lifetime, so entries can be set incrementally well before a crash and are included in every later
+// dump. `section` and `key` must be non-NULL and non-empty (otherwise the call fails). `value` may be
+// NULL; see COMMENT_STRING_OPER_TYPE for the per-operation NULL semantics. Returns FALSE if the inputs
+// are invalid or the internal buffer cannot fit the result.
+//
+// Input size limits and value normalization:
+//   - `section` and `key` accept at most 64 characters each; a longer section/key fails the call
+//     (returns FALSE) and is never truncated.
+//   - `value` accepts at most 256 characters; anything beyond that is silently TRUNCATED.
+//   - Within the (truncated) value, each '\n' to U+21B5 (a visible return arrow) and 
+//     each ';' to the full-width '；' (U+FF1B). This keeps the value on a single INI line and
+//     prevents it from colliding with the ';' token separator used by MERGE/APPEND.
+//
+// Calls are serialized against each other with a lightweight internal lock. Like the rest of this
+// library these setters are intended to be called BEFORE a crash (to attach diagnostic context); they
+// are not guaranteed to be safe to call concurrently with an in-progress WriteMiniDumpInproc.
+MINIDUMP_INPROC_API BOOL WINAPI SetMiniDumpInprocCommentA(
+    const char* section,
+    const char* key,
+    const char* value,
+    COMMENT_STRING_OPER_TYPE oper) MINIDUMP_INPROC_NOEXCEPT;
+
+MINIDUMP_INPROC_API BOOL WINAPI SetMiniDumpInprocCommentW(
+    const wchar_t* section,
+    const wchar_t* key,
+    const wchar_t* value,
+    COMMENT_STRING_OPER_TYPE oper) MINIDUMP_INPROC_NOEXCEPT;
+
+
 #ifdef __cplusplus
 }
 #endif

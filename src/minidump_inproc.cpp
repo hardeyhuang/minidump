@@ -66,7 +66,7 @@ BOOL WriteMiniDumpInprocImpl(
     const BOOL writeSelectedMemory = !writeFullMemory;
 
     ULONG32 headerRva = 0, directoryRva = sizeof(MINIDUMP_HEADER);
-    ULONG32 systemInfoRva = 0, miscInfoRva = 0, commentRva = 0, moduleListRva = 0, threadListRva = 0;
+    ULONG32 systemInfoRva = 0, miscInfoRva = 0, commentRva = 0, commentWRva = 0, moduleListRva = 0, threadListRva = 0;
     ULONG32 threadInfoListRva = 0, memoryInfoListRva = 0, memoryListRva = 0;
     ULONG32 exceptionRva = 0, threadContextsRva = 0, contextRva = 0;
     ULONG64 memoryBaseRva = 0;
@@ -85,9 +85,9 @@ BOOL WriteMiniDumpInprocImpl(
     BOOL writeThreadNames = FALSE;
 
     MINIDUMP_HEADER header = {};
-    // Up to 10 built-in stream entries (6 always-present + Exception/ThreadInfo/MemoryInfo/ThreadNames)
-    // plus one entry per admitted user stream.
-    MINIDUMP_DIRECTORY directories[10 + kMaxUserStreams] = {};
+    // Up to 11 built-in stream entries (6 always-present + CommentStreamW/Exception/ThreadInfo/
+    // MemoryInfo/ThreadNames) plus one entry per admitted user stream.
+    MINIDUMP_DIRECTORY directories[11 + kMaxUserStreams] = {};
     LARGE_INTEGER pos = {};
 
     hasException = CaptureExceptionStreamInfo(exceptionParam, &exceptionProbe, &contextProbe);
@@ -101,6 +101,13 @@ BOOL WriteMiniDumpInprocImpl(
     // is fixed. The query is heap-free and SEH-guarded, and always yields a valid NUL-terminated
     // string, so the reserved directory size stays correct even if the queries fail.
     const ULONG32 commentStreamSize = BuildMemoryCommentText();
+
+    // The user-supplied CommentStreamW (INI sections/keys set via SetMiniDumpInprocComment*) is a
+    // separate, optional wide-text stream. Its content was accumulated before the dump, so its size
+    // is already fixed; emit a directory entry only when something was actually set.
+    const ULONG32 commentWStreamSize = CommentStreamWBytes();
+    const BOOL writeCommentW = (commentWStreamSize != 0);
+    if (writeCommentW) ++streamCount;
 
     // Snapshot the caller's user streams once (validated under SEH) so layout and the write pass
     // agree on which streams are present and their sizes. Admission against the budget happens below.
@@ -153,6 +160,7 @@ BOOL WriteMiniDumpInprocImpl(
         sizeof(MINIDUMP_SYSTEM_INFO) +
         sizeof(MINIDUMP_MISC_INFO) +
         commentStreamSize +
+        (writeCommentW ? commentWStreamSize : 0) +
         moduleListStorageSize +
         threadListStreamSize +
         threadContextsSize64 +
@@ -299,6 +307,7 @@ BOOL WriteMiniDumpInprocImpl(
     systemInfoRva = nextRva; nextRva += sizeof(MINIDUMP_SYSTEM_INFO);
     miscInfoRva = nextRva; nextRva += sizeof(MINIDUMP_MISC_INFO);
     commentRva = nextRva; nextRva += commentStreamSize;
+    if (writeCommentW) { commentWRva = nextRva; nextRva += commentWStreamSize; }
     moduleListRva = nextRva; nextRva += moduleListStorageSize;
     threadListRva = nextRva; nextRva += threadListStreamSize;
     if (writeThreadNames) { threadNamesRva = nextRva; nextRva += threadNamesStorageSize; }
@@ -354,6 +363,12 @@ BOOL WriteMiniDumpInprocImpl(
     directories[streamIndex].Location.Rva = commentRva;
     directories[streamIndex].Location.DataSize = commentStreamSize;
     ++streamIndex;
+    if (writeCommentW) {
+        directories[streamIndex].StreamType = CommentStreamW;
+        directories[streamIndex].Location.Rva = commentWRva;
+        directories[streamIndex].Location.DataSize = commentWStreamSize;
+        ++streamIndex;
+    }
     directories[streamIndex].StreamType = ModuleListStream;
     directories[streamIndex].Location.Rva = moduleListRva;
     directories[streamIndex].Location.DataSize = moduleListStreamSize;
@@ -450,6 +465,11 @@ BOOL WriteMiniDumpInprocImpl(
 
     INPROC_EMIT_STREAM(systemInfoRva, WriteSystemInfo(hFile));
     INPROC_EMIT_STREAM(miscInfoRva, WriteMiscInfo(hFile));
+    // CommentStreamW holds the user's accumulated INI comment, fixed before the dump began, so it can
+    // be written here (unlike CommentStreamA, which is patched with the elapsed time and written last).
+    if (writeCommentW) {
+        INPROC_EMIT_STREAM_RESULT(commentWRva, WriteCommentStreamW(hFile, commentWStreamSize));
+    }
     // CommentStreamA is intentionally written LAST (after all other streams below) so the elapsed
     // time patched into it reflects almost the entire dump. Its file region was laid out at
     // commentRva and is seeked to at the end.
@@ -579,4 +599,70 @@ extern "C" MINIDUMP_INPROC_API BOOL WINAPI WriteMiniDumpInproc(
     minidump_inproc::internal::ResumeThreadPlan();
     InterlockedExchange(&minidump_inproc::internal::g_DumpInProgress, 0);
     return result;
+}
+
+// Records a wide-character (section, key, value) entry into the dump's CommentStreamW. See the header
+// for the full per-operation semantics. Thin wrapper over the internal INI worker.
+extern "C" MINIDUMP_INPROC_API BOOL WINAPI SetMiniDumpInprocCommentW(
+    const wchar_t* section,
+    const wchar_t* key,
+    const wchar_t* value,
+    COMMENT_STRING_OPER_TYPE oper) noexcept
+{
+    return minidump_inproc::internal::SetCommentIniW(section, key, value, oper);
+}
+
+// ANSI counterpart: converts each non-NULL input from the active ANSI code page (CP_ACP) to UTF-16
+// and forwards to the wide worker, so A and W data land in the same CommentStreamW. A NULL value is
+// forwarded as NULL (preserving the delete/no-op semantics); a conversion failure fails the call.
+// The section/key conversion buffers are intentionally sized to kCommentMaxSectionKeyChars + 1, so a
+// section/key that exceeds the limit overflows the buffer and fails here, matching the wide worker's
+// length check. The value buffer is left large; its truncation to kCommentMaxValueChars and INI
+// escaping are performed by the wide worker.
+extern "C" MINIDUMP_INPROC_API BOOL WINAPI SetMiniDumpInprocCommentA(
+    const char* section,
+    const char* key,
+    const char* value,
+    COMMENT_STRING_OPER_TYPE oper) noexcept
+{
+    constexpr int kIdCap = static_cast<int>(minidump_inproc::internal::kCommentMaxSectionKeyChars) + 1;
+    constexpr int kValCap = static_cast<int>(minidump_inproc::internal::kCommentBufferWChars);
+    wchar_t wsection[minidump_inproc::internal::kCommentMaxSectionKeyChars + 1];
+    wchar_t wkey[minidump_inproc::internal::kCommentMaxSectionKeyChars + 1];
+    wchar_t wvalue[minidump_inproc::internal::kCommentBufferWChars];
+    const wchar_t* ps = nullptr;
+    const wchar_t* pk = nullptr;
+    const wchar_t* pv = nullptr;
+
+    // The conversions dereference caller-owned char* buffers; guard them so a bad pointer fails the
+    // call instead of crashing (the wide worker is itself SEH-guarded for its inputs).
+#if defined(_MSC_VER)
+    __try {
+#endif
+        if (section != nullptr) {
+            if (MultiByteToWideChar(CP_ACP, 0, section, -1, wsection, kIdCap) == 0) {
+                return FALSE;
+            }
+            ps = wsection;
+        }
+        if (key != nullptr) {
+            if (MultiByteToWideChar(CP_ACP, 0, key, -1, wkey, kIdCap) == 0) {
+                return FALSE;
+            }
+            pk = wkey;
+        }
+        if (value != nullptr) {
+            if (MultiByteToWideChar(CP_ACP, 0, value, -1, wvalue, kValCap) == 0) {
+                return FALSE;
+            }
+            pv = wvalue;
+        }
+#if defined(_MSC_VER)
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+#endif
+
+    return minidump_inproc::internal::SetCommentIniW(ps, pk, pv, oper);
 }
