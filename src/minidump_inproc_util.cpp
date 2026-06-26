@@ -1,6 +1,7 @@
 #include "minidump_inproc_internal.h"
 
-namespace minidump_inproc::internal {
+namespace minidump_inproc {
+namespace internal {
 
 // Rounds a file RVA or stream size up to the 4-byte alignment required by the minidump format.
 
@@ -55,27 +56,35 @@ void ResolveInprocApis() noexcept
     // values are identical), but once a previous call has finished we skip the repeat work. The
     // flag is published with InterlockedExchange below, so a non-zero read here means a prior call
     // already populated g_Apis / g_NativeSystemInfo.
-    if (InterlockedCompareExchange(&g_ApisInitialized, 0, 0) != 0) {
-        return;
+    while (auto init_value = 
+        _InterlockedCompareExchange(&g_ApisInitializeStatus, INITIALIZING, NOT_INITIALIZED)) {
+        if (init_value != INITIALIZING) {
+			return;
+		}
+		YieldProcessor(); // another thread is initializing; wait for it to finish
     }
 
     GetNativeSystemInfo(&g_NativeSystemInfo);
     if (g_NativeSystemInfo.dwPageSize == 0) {
         g_NativeSystemInfo.dwPageSize = 4096;
     }
+#pragma warning(push)
+#pragma warning(disable: 4191) // 局部关闭 C4191 警告
     HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
-    g_Apis.RtlGetVersion = reinterpret_cast<RtlGetVersionFn>(
-        GetProcAddress(ntdll, "RtlGetVersion"));
-    g_Apis.NtQueryInformationThread = reinterpret_cast<NtQueryInformationThreadFn>(
-        GetProcAddress(ntdll, "NtQueryInformationThread"));
-    g_Apis.NtQuerySystemInformation = reinterpret_cast<NtQuerySystemInformationFn>(
-        GetProcAddress(ntdll, "NtQuerySystemInformation"));
-    g_Apis.NtQueryInformationProcess = reinterpret_cast<NtQueryInformationProcessFn>(
-        GetProcAddress(ntdll, "NtQueryInformationProcess"));
-    // Unloaded-module ring accessor (Windows Vista+). When absent (very old OS), the
-    // UnloadedModuleListStream is simply omitted.
-    g_Apis.RtlGetUnloadEventTraceEx = reinterpret_cast<RtlGetUnloadEventTraceExFn>(
-        GetProcAddress(ntdll, "RtlGetUnloadEventTraceEx"));
+	if (ntdll != nullptr) {
+		g_Apis.RtlGetVersion = reinterpret_cast<RtlGetVersionFn>(
+			GetProcAddress(ntdll, "RtlGetVersion"));
+		g_Apis.NtQueryInformationThread = reinterpret_cast<NtQueryInformationThreadFn>(
+			GetProcAddress(ntdll, "NtQueryInformationThread"));
+		g_Apis.NtQuerySystemInformation = reinterpret_cast<NtQuerySystemInformationFn>(
+			GetProcAddress(ntdll, "NtQuerySystemInformation"));
+		g_Apis.NtQueryInformationProcess = reinterpret_cast<NtQueryInformationProcessFn>(
+			GetProcAddress(ntdll, "NtQueryInformationProcess"));
+		// Unloaded-module ring accessor (Windows Vista+). When absent (very old OS), the
+		// UnloadedModuleListStream is simply omitted.
+		g_Apis.RtlGetUnloadEventTraceEx = reinterpret_cast<RtlGetUnloadEventTraceExFn>(
+			GetProcAddress(ntdll, "RtlGetUnloadEventTraceEx"));
+	}
 
     // GDI/USER object counts come from user32!GetGuiResources. Resolve it ONLY if user32 is already
     // mapped (GetModuleHandleW, never LoadLibraryW) so this library never forces a user32 dependency
@@ -86,8 +95,32 @@ void ResolveInprocApis() noexcept
         g_Apis.GetGuiResources = reinterpret_cast<GetGuiResourcesFn>(
             GetProcAddress(user32, "GetGuiResources"));
     }
+#pragma warning(pop)
 
-    InterlockedExchange(&g_ApisInitialized, 1);
+	// Create unnamed kernel mutexes.  Their handles are stored inside g_Protected (which
+	// becomes PAGE_READONLY after this function), so they cannot be overwritten by wild
+	// writes.  The mutex objects themselves live in kernel space, immune to user-mode
+	// corruption, and are auto-released if the owning thread terminates abnormally.
+	g_Protected.CommentMutex = CreateMutexW(nullptr, FALSE, nullptr);
+	g_Protected.DumpMutex    = CreateMutexW(nullptr, FALSE, nullptr);
+
+	// Compute and store the CRC over all populated fields (last, so a partial init can never
+	// match).  Then publish INITIALIZED so concurrent init callers can proceed.
+	SetProtectedGlobalsCrc();
+	_InterlockedExchange(&g_ApisInitializeStatus, INITIALIZED);
+
+	// Lock the page: all init-once data is now populated, so any wild write from this point
+	// forward will trigger an access violation instead of silently corrupting the globals.
+	ProtectInitGlobals();
+}
+
+// Sets the g_Protected page to PAGE_READONLY.  Safe to call multiple times (VirtualProtect
+// on an already-readonly page is a fast no-op).  We use the kernel32 wrapper (not the NTDLL
+// syscall) because this runs during normal init, not on the crash path.
+void ProtectInitGlobals() noexcept
+{
+	DWORD oldProtect = 0;
+	VirtualProtect(&g_Protected, sizeof(g_Protected), PAGE_READONLY, &oldProtect);
 }
 
 DWORD NativePageSize() noexcept
@@ -345,5 +378,134 @@ BOOL ShouldIncludeExtraMemoryRange(const MEMORY_BASIC_INFORMATION& mbi,
     return FALSE;
 }
 
+    // Returns a pointer to the next character in a UTF-8 encoded string
+	LPCSTR UTF8CharNextA(LPCSTR lpCurrentChar) noexcept
+	{
+		if (lpCurrentChar == nullptr)
+			return nullptr;
 
-} // namespace minidump_inproc::internal
+		const unsigned char* p = reinterpret_cast<const unsigned char*>(lpCurrentChar);
+
+		unsigned char c = *p;
+
+		if (c == 0)
+		{
+			// End of string, do not advance
+			return lpCurrentChar;
+		}
+		else if ((c & 0x80) == 0x00) {
+			// ASCII, 1 byte, no continuation bytes to check
+			p += 1;
+		}
+		else if ((c & 0xE0) == 0xC0) {
+			// 2-byte sequence, expect 1 continuation byte (10xxxxxx)
+			if ((p[1] & 0xC0) == 0x80)
+				p += 2;
+			else
+				p += 1; // Truncated or invalid, advance 1 byte to recover
+		}
+		else if ((c & 0xF0) == 0xE0) {
+			// 3-byte sequence, expect 2 continuation bytes (10xxxxxx)
+			if ((p[1] & 0xC0) == 0x80 && (p[2] & 0xC0) == 0x80)
+				p += 3;
+			else if ((p[1] & 0xC0) == 0x80)
+				p += 2; // Only 1 valid continuation byte found
+			else
+				p += 1; // No valid continuation byte, advance 1 byte to recover
+		}
+		else if ((c & 0xF8) == 0xF0) {
+			// 4-byte sequence, expect 3 continuation bytes (10xxxxxx)
+			if ((p[1] & 0xC0) == 0x80 && (p[2] & 0xC0) == 0x80 && (p[3] & 0xC0) == 0x80)
+				p += 4;
+			else if ((p[1] & 0xC0) == 0x80 && (p[2] & 0xC0) == 0x80)
+				p += 3; // Only 2 valid continuation bytes found
+			else if ((p[1] & 0xC0) == 0x80)
+				p += 2; // Only 1 valid continuation byte found
+			else
+				p += 1; // No valid continuation byte, advance 1 byte to recover
+		}
+		else {
+			// Invalid leading byte, advance 1 byte to recover
+			p += 1;
+		}
+
+		return reinterpret_cast<LPCSTR>(p);
+	}
+
+	// Returns a pointer to the next character in a DBCS encoded string.
+	// DBCS (Double Byte Character Set):
+	// Lead byte     → 2-byte character, advance 2 bytes
+	// Non-lead byte → 1-byte character, advance 1 byte
+	LPCSTR DBCSCharNextA(LPCSTR lpCurrentChar) noexcept
+	{
+		if (lpCurrentChar == nullptr)
+			return nullptr;
+
+		const unsigned char* p = reinterpret_cast<const unsigned char*>(lpCurrentChar);
+		if (*p == 0) {
+			// End of string, do not advance
+			return lpCurrentChar;
+		}
+
+		// IsDBCSLeadByte checks whether the byte is a DBCS lead byte
+		// based on the current thread ACP (e.g. GBK: 0x81~0xFE, Shift-JIS: 0x81~0x9F / 0xE0~0xFC)
+		if (IsDBCSLeadByte(*p)) {
+			// Lead byte found, expect a trail byte to follow
+			// Guard against a truncated sequence where trail byte is '\0'
+			if (*(p + 1) != 0)
+				p += 2;
+			else
+				p += 1; // Truncated sequence, advance 1 byte to recover
+		}
+		else {
+			// Single-byte character
+			p += 1;
+		}
+
+		return reinterpret_cast<LPCSTR>(p);
+	}
+
+	// Truncates the input multi-byte string to the maximum allowed length to covert to wide string.
+	// Returns the number of bytes to convert.
+	int TruncateMultiByteString(LPCSTR lpMultiByteStr, int maxWideChars) noexcept
+	{
+		if (lpMultiByteStr == nullptr) {
+			return 0;
+		}
+		LPCSTR lpEnd = lpMultiByteStr;
+		int left = maxWideChars;
+		if (GetACP() == CP_UTF8) {
+			while (left > 0) {
+				--left;
+				LPCSTR lpNext = UTF8CharNextA(lpEnd);
+				if (lpEnd == lpNext) {
+					// Reached the end of the string
+					break;
+				}
+				if (lpNext - lpEnd >= 4) {
+					// 4-byte utf-8 character, count as 2 utf-16 characters
+					if (left == 0) {
+						// No more space for the second utf-16 character, truncate here
+						break;
+					}
+					--left;
+				}
+				lpEnd = lpNext;
+			}
+		}
+		else {
+			while (left > 0) {
+				--left;
+				LPCSTR lpNext = DBCSCharNextA(lpEnd);
+				if (lpEnd == lpNext) {
+					// Reached the end of the string
+					break;
+				}
+				lpEnd = lpNext;
+			}
+		}
+		return static_cast<int>(lpEnd - lpMultiByteStr);
+	}
+
+} // namespace internal
+} // namespace minidump_inproc

@@ -1,6 +1,7 @@
 #include "minidump_inproc_internal.h"
 
-namespace minidump_inproc::internal {
+namespace minidump_inproc {
+namespace internal {
 
 // Counts modules by walking PEB_LDR_DATA directly instead of using ToolHelp or loader enumeration APIs.
 // The minidump ModuleListStream DataSize must include only count + MINIDUMP_MODULE[];
@@ -186,49 +187,43 @@ BOOL WriteModuleCodeViewRecord(HANDLE hFile, PVOID moduleBase, ULONG32* writtenS
     return TRUE;
 }
 
-// Writes ModuleListStream descriptors and their trailing strings/CodeView records; stream size excludes trailing storage per minidump rules.
+// ModuleListStream is laid out as: count + MINIDUMP_MODULE[] (the stream's DataSize), then the name
+// strings, then the CodeView records (both referenced by RVA, outside DataSize). The four helpers
+// below each walk the in-memory-order module list once for one of those layout phases; WriteModuleList
+// orchestrates them. The walks must stay separate because the regions are non-contiguous on disk and
+// pass 2 needs every name length up front (pass 1) to address the CodeView region.
 
-BOOL WriteModuleList(HANDLE hFile, ULONG32 moduleCount, ULONG32 moduleListRva) noexcept
+// Phase 1: sums all module name-string sizes to derive the RVA where CodeView records begin (right
+// after the descriptor array and the name-string region).
+static ULONG32 ComputeModuleCodeViewBaseRva(LIST_ENTRY* head, LIST_ENTRY* first,
+                                            ULONG32 moduleCount, ULONG32 stringRva) noexcept
 {
-    INPROC_PEB* peb = GetCurrentPeb();
-    INPROC_PEB_LDR_DATA* ldr = nullptr;
-    LIST_ENTRY* head = nullptr;
-    LIST_ENTRY* current = nullptr;
-    ULONG32 writtenModules = 0;
-    ULONG32 stringRva = moduleListRva + sizeof(ULONG32) + moduleCount * sizeof(MINIDUMP_MODULE);
     ULONG32 cvRva = stringRva;
-    LARGE_INTEGER stringPos = {};
-
-
-    if (!WriteAll(hFile, &moduleCount, sizeof(moduleCount))) {
-        return FALSE;
-    }
-
-    if (peb == nullptr || !SafeCopyBytes(&ldr, &peb->Ldr, sizeof(PVOID)) || ldr == nullptr) {
-        return TRUE;
-    }
-
-    head = &ldr->InMemoryOrderModuleList;
-    if (!SafeCopyBytes(&current, &head->Flink, sizeof(PVOID))) {
-        return TRUE;
-    }
-
-    LIST_ENTRY* rvaScan = current;
-    ULONG32 scannedModules = 0;
-    while (rvaScan != nullptr && rvaScan != head && scannedModules < moduleCount) {
-        INPROC_LDR_DATA_TABLE_ENTRY* entry = CONTAINING_RECORD(rvaScan, INPROC_LDR_DATA_TABLE_ENTRY, InMemoryOrderLinks);
+    LIST_ENTRY* scan = first;
+    ULONG32 scanned = 0;
+    while (scan != nullptr && scan != head && scanned < moduleCount) {
+        INPROC_LDR_DATA_TABLE_ENTRY* entry = CONTAINING_RECORD(scan, INPROC_LDR_DATA_TABLE_ENTRY, InMemoryOrderLinks);
+        cvRva += MinidumpStringSize(SafeModuleNameLength(&entry->FullDllName));
+        ++scanned;
         LIST_ENTRY* next = nullptr;
-        ULONG32 nameLength = SafeModuleNameLength(&entry->FullDllName);
-        cvRva += MinidumpStringSize(nameLength);
-        ++scannedModules;
-        if (!SafeCopyBytes(&next, &rvaScan->Flink, sizeof(PVOID))) {
+        if (!SafeCopyBytes(&next, &scan->Flink, sizeof(PVOID))) {
             break;
         }
-        rvaScan = next;
+        scan = next;
     }
+    return cvRva;
+}
 
+// Phase 2: writes the MINIDUMP_MODULE descriptor array, pre-filling each record's name/CodeView RVA
+// from the running cursors so the trailing regions line up. A short walk zero-fills the remaining
+// descriptors. *stringRegionEndRva receives the post-walk string cursor for the caller's fallback.
+static BOOL WriteModuleDescriptors(HANDLE hFile, LIST_ENTRY* head, LIST_ENTRY* first,
+                                   ULONG32 moduleCount, ULONG32 stringRva, ULONG32 cvRva,
+                                   ULONG32* stringRegionEndRva) noexcept
+{
+    LIST_ENTRY* current = first;
+    ULONG32 writtenModules = 0;
     while (current != nullptr && current != head && writtenModules < moduleCount) {
-
         INPROC_LDR_DATA_TABLE_ENTRY* entry = CONTAINING_RECORD(current, INPROC_LDR_DATA_TABLE_ENTRY, InMemoryOrderLinks);
         MINIDUMP_MODULE module = {};
         INPROC_UNICODE_STRING name = {};
@@ -242,7 +237,6 @@ BOOL WriteModuleList(HANDLE hFile, ULONG32 moduleCount, ULONG32 moduleListRva) n
 
         (void)SafeCopyBytes(&moduleBase, &entry->DllBase, sizeof(PVOID));
         (void)SafeCopyBytes(&module.BaseOfImage, &entry->DllBase, sizeof(entry->DllBase));
-
         (void)SafeCopyBytes(&module.SizeOfImage, &entry->SizeOfImage, sizeof(entry->SizeOfImage));
         (void)SafeCopyBytes(&name, &entry->FullDllName, sizeof(name));
         nameLength = SafeModuleNameLength(&entry->FullDllName);
@@ -261,7 +255,6 @@ BOOL WriteModuleList(HANDLE hFile, ULONG32 moduleCount, ULONG32 moduleListRva) n
         }
 
         if (!WriteAll(hFile, &module, sizeof(module))) {
-
             return FALSE;
         }
 
@@ -274,21 +267,21 @@ BOOL WriteModuleList(HANDLE hFile, ULONG32 moduleCount, ULONG32 moduleListRva) n
         current = next;
     }
 
+    *stringRegionEndRva = stringRva;
+
     if (writtenModules < moduleCount && !WriteZeros(hFile, (moduleCount - writtenModules) * sizeof(MINIDUMP_MODULE))) {
         return FALSE;
     }
+    return TRUE;
+}
 
-    stringPos.QuadPart = moduleListRva + sizeof(ULONG32) + moduleCount * sizeof(MINIDUMP_MODULE);
-    if (!SetFilePointerEx(hFile, stringPos, nullptr, FILE_BEGIN)) {
-        return FALSE;
-    }
-
-    current = nullptr;
-    writtenModules = 0;
-    if (!SafeCopyBytes(&current, &head->Flink, sizeof(PVOID))) {
-        return WriteZeros(hFile, stringRva - stringPos.QuadPart);
-    }
-
+// Phase 3: writes one MINIDUMP_STRING per module name, padding any modules beyond the walk with empty
+// strings so the string count always matches the descriptor array.
+static BOOL WriteModuleNameStrings(HANDLE hFile, LIST_ENTRY* head, LIST_ENTRY* first,
+                                   ULONG32 moduleCount) noexcept
+{
+    LIST_ENTRY* current = first;
+    ULONG32 writtenModules = 0;
     while (current != nullptr && current != head && writtenModules < moduleCount) {
         INPROC_LDR_DATA_TABLE_ENTRY* entry = CONTAINING_RECORD(current, INPROC_LDR_DATA_TABLE_ENTRY, InMemoryOrderLinks);
         LIST_ENTRY* next = nullptr;
@@ -311,13 +304,15 @@ BOOL WriteModuleList(HANDLE hFile, ULONG32 moduleCount, ULONG32 moduleListRva) n
         }
         ++writtenModules;
     }
+    return TRUE;
+}
 
-    current = nullptr;
-    writtenModules = 0;
-    if (!SafeCopyBytes(&current, &head->Flink, sizeof(PVOID))) {
-        return TRUE;
-    }
-
+// Phase 4: writes each module's CodeView record (or an empty placeholder) in list order.
+static BOOL WriteModuleCodeViewRecords(HANDLE hFile, LIST_ENTRY* head, LIST_ENTRY* first,
+                                       ULONG32 moduleCount) noexcept
+{
+    LIST_ENTRY* current = first;
+    ULONG32 writtenModules = 0;
     while (current != nullptr && current != head && writtenModules < moduleCount) {
         INPROC_LDR_DATA_TABLE_ENTRY* entry = CONTAINING_RECORD(current, INPROC_LDR_DATA_TABLE_ENTRY, InMemoryOrderLinks);
         LIST_ENTRY* next = nullptr;
@@ -335,8 +330,62 @@ BOOL WriteModuleList(HANDLE hFile, ULONG32 moduleCount, ULONG32 moduleListRva) n
         }
         current = next;
     }
-
     return TRUE;
+}
+
+// Writes ModuleListStream descriptors and their trailing strings/CodeView records; stream size excludes trailing storage per minidump rules.
+
+BOOL WriteModuleList(HANDLE hFile, ULONG32 moduleCount, ULONG32 moduleListRva) noexcept
+{
+    INPROC_PEB* peb = GetCurrentPeb();
+    INPROC_PEB_LDR_DATA* ldr = nullptr;
+    LIST_ENTRY* head = nullptr;
+    LIST_ENTRY* first = nullptr;
+    const ULONG32 stringRva = moduleListRva + sizeof(ULONG32) + moduleCount * sizeof(MINIDUMP_MODULE);
+    LARGE_INTEGER stringPos = {};
+
+    if (!WriteAll(hFile, &moduleCount, sizeof(moduleCount))) {
+        return FALSE;
+    }
+
+    if (peb == nullptr || !SafeCopyBytes(&ldr, &peb->Ldr, sizeof(PVOID)) || ldr == nullptr) {
+        return TRUE;
+    }
+
+    head = &ldr->InMemoryOrderModuleList;
+    if (!SafeCopyBytes(&first, &head->Flink, sizeof(PVOID))) {
+        return TRUE;
+    }
+
+    // Phase 1: derive where CodeView records begin (after the descriptor array + all name strings).
+    const ULONG32 cvRva = ComputeModuleCodeViewBaseRva(head, first, moduleCount, stringRva);
+
+    // Phase 2: descriptor array. stringRegionEndRva is the post-walk string cursor used by the
+    // corruption fallback below (matches the legacy in-place accumulation exactly).
+    ULONG32 stringRegionEndRva = stringRva;
+    if (!WriteModuleDescriptors(hFile, head, first, moduleCount, stringRva, cvRva, &stringRegionEndRva)) {
+        return FALSE;
+    }
+
+    // Phase 3: name strings, seeked to the region right after the descriptor array.
+    stringPos.QuadPart = stringRva;
+    if (!SetFilePointerEx(hFile, stringPos, nullptr, FILE_BEGIN)) {
+        return FALSE;
+    }
+    first = nullptr;
+    if (!SafeCopyBytes(&first, &head->Flink, sizeof(PVOID))) {
+        return WriteZeros(hFile, stringRegionEndRva - stringPos.QuadPart);
+    }
+    if (!WriteModuleNameStrings(hFile, head, first, moduleCount)) {
+        return FALSE;
+    }
+
+    // Phase 4: CodeView records.
+    first = nullptr;
+    if (!SafeCopyBytes(&first, &head->Flink, sizeof(PVOID))) {
+        return TRUE;
+    }
+    return WriteModuleCodeViewRecords(hFile, head, first, moduleCount);
 }
 
 
@@ -532,5 +581,5 @@ BOOL WriteUnloadedModuleList(HANDLE hFile, ULONG32 count, ULONG32 streamRva) noe
 }
 
 
-
-} // namespace minidump_inproc::internal
+} // namespace internal
+} // namespace minidump_inproc

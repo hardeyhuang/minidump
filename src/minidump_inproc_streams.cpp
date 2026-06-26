@@ -1,6 +1,8 @@
 #include "minidump_inproc_internal.h"
 
-namespace minidump_inproc::internal {
+namespace minidump_inproc {
+namespace internal {
+
 
 // Writes SystemInfoStream using kernel system information and pre-resolved RtlGetVersion when available.
 
@@ -9,7 +11,7 @@ BOOL WriteSystemInfo(HANDLE hFile) noexcept
     MINIDUMP_SYSTEM_INFO info = {};
     const SYSTEM_INFO& sys = g_NativeSystemInfo;
     RTL_OSVERSIONINFOEXW_INPROC version = {};
-    RtlGetVersionFn rtlGetVersion = g_Apis.RtlGetVersion;
+    const RtlGetVersionFn rtlGetVersion = g_Apis.RtlGetVersion;
 
     info.ProcessorArchitecture = sys.wProcessorArchitecture;
     info.ProcessorLevel = sys.wProcessorLevel;
@@ -18,7 +20,6 @@ BOOL WriteSystemInfo(HANDLE hFile) noexcept
 
     version.dwOSVersionInfoSize = sizeof(version);
     if (rtlGetVersion != nullptr && rtlGetVersion(&version) >= 0) {
-
         info.MajorVersion = version.dwMajorVersion;
         info.MinorVersion = version.dwMinorVersion;
         info.BuildNumber = version.dwBuildNumber;
@@ -201,16 +202,20 @@ ULONG32 CommentAppendKB(char* buf, ULONG32 cap, ULONG32 pos, ULONG64 bytes) noex
     return pos;
 }
 
+
 // ---- CommentStreamW INI buffer helpers --------------------------------------------------------
 // The user comment is kept as a flat, NUL-terminated wide INI text in g_CommentBufferW, e.g.
 //   [Section]\nKey1=Value1\nKey2=Value2\n[Other]\nKeyA=ValueA\n
-// All edits are performed in place under g_CommentLock; no heap is used.
+// All edits are performed in place under g_Protected.CommentMutex (kernel mutex); no heap is used.
 
 // Wide string length without depending on the CRT (also keeps the crash path self-contained).
-ULONG32 CommentWStrLen(const wchar_t* s) noexcept
+ULONG32 CommentWStrLen(const wchar_t* s, ULONG32 cap) noexcept
 {
+    if (s == nullptr) {
+        return 0;
+    }
     ULONG32 n = 0;
-    while (s[n] != L'\0') {
+    while (n < cap && s[n] != L'\0') {
         ++n;
     }
     return n;
@@ -227,11 +232,24 @@ BOOL CommentWRangeEqual(const wchar_t* a, const wchar_t* b, ULONG32 n) noexcept
     return TRUE;
 }
 
+// Verify the stored CRC against a fresh computation.  Returns FALSE when the buffer has been
+// corrupted since the last update; callers should fail the operation or degrade gracefully.
+BOOL VerifyCommentBufferWCrc() noexcept {
+    auto len = CommentWStrLen(g_CommentBufferW, kCommentBufferWChars - 1);
+    return ComputeCrc32(g_CommentBufferW, len) == g_CommentBufferWCrc;
+}
+
+// Resets the buffer to empty.
+VOID ResetCommentBufferW() noexcept {
+    g_CommentBufferW[0] = L'\0';
+    g_CommentBufferWCrc = ComputeCrc32(g_CommentBufferW, 0);
+}
+
 // Replaces g_CommentBufferW[at, at+removeLen) with `insLen` WCHARs from `ins`, keeping the buffer
 // NUL-terminated. Returns FALSE (leaving the buffer unchanged) if the result would not fit.
 BOOL CommentSplice(ULONG32 at, ULONG32 removeLen, const wchar_t* ins, ULONG32 insLen) noexcept
 {
-    const ULONG32 len = g_CommentWChars;
+    const ULONG32 len = CommentWStrLen(g_CommentBufferW,kCommentBufferWChars - 1);
     const ULONG32 newLen = len - removeLen + insLen;
     if (newLen + 1u > kCommentBufferWChars) {
         return FALSE; // no room for the content + terminating NUL
@@ -245,8 +263,8 @@ BOOL CommentSplice(ULONG32 at, ULONG32 removeLen, const wchar_t* ins, ULONG32 in
     for (ULONG32 i = 0; i < insLen; ++i) {
         buf[at + i] = ins[i];
     }
-    g_CommentWChars = newLen;
     buf[newLen] = L'\0';
+    g_CommentBufferWCrc = ComputeCrc32(buf, newLen);
     return TRUE;
 }
 
@@ -280,8 +298,9 @@ ULONG32 CommentNormalizeValue(wchar_t* dst, const wchar_t* src) noexcept
 BOOL CommentIniApply(const wchar_t* section, const wchar_t* key, const wchar_t* value,
                      COMMENT_STRING_OPER_TYPE oper) noexcept
 {
-    const ULONG32 secLen = CommentWStrLen(section);
-    const ULONG32 keyLen = CommentWStrLen(key);
+    // 0xffffffff for no truncation
+    const ULONG32 secLen = CommentWStrLen(section, 0xffffffff);
+    const ULONG32 keyLen = CommentWStrLen(key, 0xffffffff);
     if (secLen == 0 || keyLen == 0) {
         return FALSE;
     }
@@ -299,7 +318,7 @@ BOOL CommentIniApply(const wchar_t* section, const wchar_t* key, const wchar_t* 
     wchar_t frag[kCommentMaxFragmentWChars];
 
     wchar_t* buf = g_CommentBufferW;
-    const ULONG32 len = g_CommentWChars;
+    const ULONG32 len = CommentWStrLen(g_CommentBufferW, kCommentBufferWChars - 1);
 
     // Locate the section header line "[section]" and the byte span of its body.
     BOOL secFound = FALSE;
@@ -452,7 +471,7 @@ BOOL CommentIniApply(const wchar_t* section, const wchar_t* key, const wchar_t* 
 } // namespace
 
 
-// Builds the ANSI comment text (system + process memory summary) into g_CommentBuffer, formatted as
+// Builds the ANSI comment text (system + process memory summary) into g_CommentBufferA, formatted as
 // INI ([Section] + Key=Value lines) to mirror the user CommentStreamW layout. The crash path stays
 // heap-free: values come from a kernel32 syscall wrapper (GlobalMemoryStatusEx) and a pre-resolved
 // NtQueryInformationProcess, both SEH-guarded, and the text is formatted in place. WinDbg
@@ -460,7 +479,7 @@ BOOL CommentIniApply(const wchar_t* section, const wchar_t* key, const wchar_t* 
 
 ULONG32 BuildMemoryCommentText() noexcept
 {
-    char* buf = g_CommentBuffer;
+    char* buf = g_CommentBufferA;
     const ULONG32 cap = kCommentBufferBytes;
     // INI layout: each metric group is a [Section] header followed by one Key=Value per line, matching
     // the user CommentStreamW format so the same parsers/eyes can read both. A leading newline keeps
@@ -557,12 +576,11 @@ ULONG32 BuildMemoryCommentText() noexcept
     // keeps the stream's DataSize stable while still letting the final number vary in width.
     pos = CommentAppendStr(buf, cap, pos, "[ProcTime]\nElapsed=");
     g_CommentElapsedOffset = kCommentElapsedUnset;
-    if (pos + kCommentElapsedWidth + 4u < cap) { // room for the field + "ms" + "\n" + NUL
+    if (pos + kCommentElapsedWidth + 2u < cap) { // room for the field + "\n" + NUL
         g_CommentElapsedOffset = pos;
         for (ULONG32 i = 0; i < kCommentElapsedWidth; ++i) {
             buf[pos++] = ' ';
         }
-        pos = CommentAppendStr(buf, cap, pos, "ms");
     }
     pos = CommentAppendStr(buf, cap, pos, "\n");
 
@@ -579,7 +597,6 @@ ULONG32 BuildMemoryCommentText() noexcept
     if (aligned > cap) {
         aligned = cap;
     }
-    g_CommentBytes = aligned;
     return aligned;
 }
 
@@ -594,28 +611,16 @@ void PatchCommentElapsed(ULONG64 elapsedMillis) noexcept
         return;
     }
 
-    // Render the decimal digits least-significant-first.
-    char digits[24];
-    ULONG32 count = 0;
-    if (elapsedMillis == 0) {
-        digits[count++] = '0';
+    char* field = g_CommentBufferA + g_CommentElapsedOffset;
+    if (elapsedMillis >= 1000 * 1000) {
+        CommentAppendStr(field, kCommentElapsedWidth, 0, ">1000s");
     }
-    while (elapsedMillis != 0 && count < sizeof(digits)) {
-        digits[count++] = static_cast<char>('0' + static_cast<int>(elapsedMillis % 10));
-        elapsedMillis /= 10;
-    }
-    // Clamp to the reserved width (overflow would be absurdly long; keep the low digits).
-    if (count > kCommentElapsedWidth) {
-        count = kCommentElapsedWidth;
-    }
-
-    char* field = g_CommentBuffer + g_CommentElapsedOffset;
-    const ULONG32 padding = kCommentElapsedWidth - count; // right-justify with leading spaces
-    for (ULONG32 i = 0; i < padding; ++i) {
-        field[i] = ' ';
-    }
-    for (ULONG32 i = 0; i < count; ++i) {
-        field[padding + i] = digits[count - 1 - i];
+    else if (elapsedMillis >= 10 * 1000) {
+        auto pos = CommentAppendU64(field, kCommentElapsedWidth, 0, elapsedMillis / 1000);
+        CommentAppendStr(field, kCommentElapsedWidth, pos, "s");
+    } else {
+        auto pos = CommentAppendU64(field, kCommentElapsedWidth, 0, elapsedMillis);
+        CommentAppendStr(field, kCommentElapsedWidth, pos, "ms");
     }
 }
 
@@ -631,12 +636,13 @@ INPROC_STREAM_WRITE_RESULT WriteCommentStream(HANDLE hFile, ULONG32 byteLen) noe
     if (byteLen > kCommentBufferBytes) {
         byteLen = kCommentBufferBytes;
     }
-    return StreamResultFromBool(WriteAll(hFile, g_CommentBuffer, byteLen));
+    return StreamResultFromBool(WriteAll(hFile, g_CommentBufferA, byteLen));
 }
 
 
 // Applies one user (section, key, value) operation to the persistent CommentStreamW INI buffer.
-// Serialized via g_CommentLock and SEH-guarded so a bad caller pointer cannot crash the process.
+// Serialized via g_Protected.CommentMutex (kernel mutex) and SEH-guarded so a bad caller pointer
+// or SEH fault inside the operation cannot crash the process.
 
 BOOL SetCommentIniW(const wchar_t* section, const wchar_t* key, const wchar_t* value,
                     COMMENT_STRING_OPER_TYPE oper) noexcept
@@ -646,10 +652,19 @@ BOOL SetCommentIniW(const wchar_t* section, const wchar_t* key, const wchar_t* v
         return FALSE;
     }
 
-    // Lightweight spin lock: serializes concurrent setters. (Not intended to be held against an
-    // in-progress dump; see the public header note.)
-    while (InterlockedExchange(&g_CommentLock, 1) != 0) {
-        YieldProcessor();
+    // Use the kernel mutex stored in the protected page.  The handle value cannot be corrupted
+    // (PAGE_READONLY), and the mutex object itself lives in kernel space — immune to user-mode
+    // memory damage.  If the owning thread crashes inside CommentIniApply, the kernel releases
+    // the mutex automatically, so a corrupted process can never deadlock future setters.
+    HANDLE mtx = g_Protected.CommentMutex;
+    if (mtx == nullptr || WaitForSingleObject(mtx, INFINITE) != WAIT_OBJECT_0) {
+        SetLastError(ERROR_NOT_READY);
+        return FALSE;
+    }
+
+    // If the buffer was corrupted since the last mutation, reset it.
+    if (!VerifyCommentBufferWCrc()) {
+        ResetCommentBufferW();
     }
 
     BOOL ok = FALSE;
@@ -663,7 +678,7 @@ BOOL SetCommentIniW(const wchar_t* section, const wchar_t* key, const wchar_t* v
     ok = CommentIniApply(section, key, value, oper);
 #endif
 
-    InterlockedExchange(&g_CommentLock, 0);
+	ReleaseMutex(mtx);
     if (!ok) {
         SetLastError(ERROR_INVALID_PARAMETER);
     }
@@ -675,10 +690,11 @@ BOOL SetCommentIniW(const wchar_t* section, const wchar_t* key, const wchar_t* v
 
 ULONG32 CommentStreamWBytes() noexcept
 {
-    if (g_CommentWChars == 0) {
+    auto len = CommentWStrLen(g_CommentBufferW, kCommentBufferWChars - 1);
+    if (len == 0) {
         return 0;
     }
-    const ULONG64 bytes = (static_cast<ULONG64>(g_CommentWChars) + 1) * sizeof(WCHAR);
+    const ULONG64 bytes = (static_cast<ULONG64>(len) + 1) * sizeof(WCHAR);
     return static_cast<ULONG32>(Align4(bytes));
 }
 
@@ -690,7 +706,13 @@ INPROC_STREAM_WRITE_RESULT WriteCommentStreamW(HANDLE hFile, ULONG32 byteLen) no
     if (byteLen == 0) {
         return InprocStreamSkip;
     }
-    ULONG32 contentBytes = (g_CommentWChars + 1u) * static_cast<ULONG32>(sizeof(WCHAR));
+    // The buffer sits in writable memory alongside data that gets hammered during normal
+    // execution; verify the CRC before using it on the crash path.
+    if (!VerifyCommentBufferWCrc()) {
+        return InprocStreamSkip;
+    }
+    ULONG32 len = CommentWStrLen(g_CommentBufferW, kCommentBufferWChars - 1);
+    ULONG32 contentBytes = (len + 1) * static_cast<ULONG32>(sizeof(WCHAR));
     if (contentBytes > byteLen) {
         contentBytes = byteLen;
     }
@@ -770,20 +792,22 @@ BOOL WriteUserStreams(HANDLE hFile, ULONG32 count) noexcept
 }
 
 
-// Writes ExceptionStream and points it at the already-laid-out exception thread context record.
+// Writes the captured exception stream (CONTEXT + MINIDUMP_EXCEPTION_STREAM).
 
-INPROC_STREAM_WRITE_RESULT WriteExceptionStream(HANDLE hFile, ULONG32 contextRva, const MINIDUMP_EXCEPTION_STREAM* capturedException) noexcept
+INPROC_STREAM_WRITE_RESULT WriteExceptionStream(HANDLE hFile, const CONTEXT* context, const MINIDUMP_EXCEPTION_STREAM* capturedException) noexcept
 {
     if (capturedException == nullptr) {
         return InprocStreamSkip;
     }
-
-    MINIDUMP_EXCEPTION_STREAM stream = *capturedException;
-    stream.ThreadContext.Rva = contextRva;
-    stream.ThreadContext.DataSize = sizeof(CONTEXT);
-
-    return StreamResultFromBool(WriteAll(hFile, &stream, sizeof(stream)));
+    if (!WriteAll(hFile, capturedException, sizeof(MINIDUMP_EXCEPTION_STREAM))) {
+		return InprocStreamIoFailed;
+	}
+    if (!WriteAll(hFile, context, sizeof(CONTEXT))) {
+        return InprocStreamIoFailed;
+    }
+    return InprocStreamOk;
 }
 
 
-} // namespace minidump_inproc::internal
+} // namespace internal
+} // namespace minidump_inproc

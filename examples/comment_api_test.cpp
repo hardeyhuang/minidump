@@ -29,13 +29,12 @@ const wchar_t kFwSemi = static_cast<wchar_t>(0xFF1B);  // ';'  -> full-width sem
 
 void ResetComment() noexcept
 {
-    mi::g_CommentWChars = 0;
     mi::g_CommentBufferW[0] = L'\0';
 }
 
 std::wstring Stored()
 {
-    return std::wstring(mi::g_CommentBufferW, mi::g_CommentWChars);
+    return std::wstring(mi::g_CommentBufferW);
 }
 
 std::string HexDump(const std::wstring& s)
@@ -63,8 +62,7 @@ void CheckBool(const char* name, bool cond)
 void CheckStored(const char* name, const std::wstring& expected)
 {
     const std::wstring actual = Stored();
-    const bool terminated = (mi::g_CommentBufferW[mi::g_CommentWChars] == L'\0');
-    if (actual == expected && terminated) {
+    if (actual == expected) {
         ++g_pass;
         std::printf("[PASS] %s\n", name);
     } else {
@@ -74,9 +72,6 @@ void CheckStored(const char* name, const std::wstring& expected)
                     static_cast<unsigned>(expected.size()), HexDump(expected).c_str());
         std::printf("       actual   (%u): %s\n",
                     static_cast<unsigned>(actual.size()), HexDump(actual).c_str());
-        if (!terminated) {
-            std::printf("       (buffer not NUL-terminated at g_CommentWChars)\n");
-        }
     }
 }
 

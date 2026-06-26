@@ -1,19 +1,20 @@
 #include "minidump_inproc_internal.h"
 
-namespace minidump_inproc::internal {
+namespace minidump_inproc {
+namespace internal {
 
 // Copies the caller-provided exception record and context pointers into minidump exception-stream form.
 
 BOOL CaptureExceptionStreamInfo(
     PMINIDUMP_EXCEPTION_INFORMATION exceptionParam,
     MINIDUMP_EXCEPTION_STREAM* stream,
-    const CONTEXT** contextRecord) noexcept
+    const CONTEXT** exceptionContext) noexcept
 {
     EXCEPTION_POINTERS* pointers = nullptr;
-    EXCEPTION_RECORD record = {};
+    EXCEPTION_RECORD exception = {};
     CONTEXT* context = nullptr;
 
-    *contextRecord = nullptr;
+    *exceptionContext = nullptr;
     ZeroMemory(stream, sizeof(*stream));
 
     if (exceptionParam == nullptr) {
@@ -25,24 +26,24 @@ BOOL CaptureExceptionStreamInfo(
     if (!SafeCopyBytes(&context, &pointers->ContextRecord, sizeof(PVOID)) || context == nullptr) {
         return FALSE;
     }
-    if (!SafeCopyBytes(&record, pointers->ExceptionRecord, sizeof(record))) {
+    if (!SafeCopyBytes(&exception, pointers->ExceptionRecord, sizeof(exception))) {
         return FALSE;
     }
 
     stream->ThreadId = exceptionParam->ThreadId;
-    stream->ExceptionRecord.ExceptionCode = record.ExceptionCode;
-    stream->ExceptionRecord.ExceptionFlags = record.ExceptionFlags;
-    stream->ExceptionRecord.ExceptionRecord = reinterpret_cast<ULONG64>(record.ExceptionRecord);
-    stream->ExceptionRecord.ExceptionAddress = reinterpret_cast<ULONG64>(record.ExceptionAddress);
-    stream->ExceptionRecord.NumberParameters = record.NumberParameters > EXCEPTION_MAXIMUM_PARAMETERS
+    stream->ExceptionRecord.ExceptionCode = exception.ExceptionCode;
+    stream->ExceptionRecord.ExceptionFlags = exception.ExceptionFlags;
+    stream->ExceptionRecord.ExceptionRecord = reinterpret_cast<ULONG64>(exception.ExceptionRecord);
+    stream->ExceptionRecord.ExceptionAddress = reinterpret_cast<ULONG64>(exception.ExceptionAddress);
+    stream->ExceptionRecord.NumberParameters = exception.NumberParameters > EXCEPTION_MAXIMUM_PARAMETERS
         ? EXCEPTION_MAXIMUM_PARAMETERS
-        : record.NumberParameters;
+        : exception.NumberParameters;
 
     for (ULONG i = 0; i < stream->ExceptionRecord.NumberParameters; ++i) {
-        stream->ExceptionRecord.ExceptionInformation[i] = static_cast<ULONG64>(record.ExceptionInformation[i]);
+        stream->ExceptionRecord.ExceptionInformation[i] = static_cast<ULONG64>(exception.ExceptionInformation[i]);
     }
 
-    *contextRecord = context;
+    *exceptionContext = context;
     return TRUE;
 }
 
@@ -163,59 +164,6 @@ PVOID SnapshotThreadTeb(const INPROC_THREAD_SNAPSHOT& snapshot, ULONG32 index) n
 }
 
 
-// Extracts stack limits from an extended thread snapshot when available.
-
-BOOL SnapshotThreadStackRange(const INPROC_THREAD_SNAPSHOT& snapshot,
-                              ULONG32 index,
-                              ULONG64* stackStart,
-                              ULONG32* stackSize) noexcept
-{
-    *stackStart = 0;
-    *stackSize = 0;
-
-    const INPROC_SYSTEM_EXTENDED_THREAD_INFORMATION* info = SnapshotExtendedThreadInfo(snapshot, index);
-    if (info != nullptr) {
-        ULONG64 base = reinterpret_cast<ULONG64>(info->StackBase);
-        ULONG64 limit = reinterpret_cast<ULONG64>(info->StackLimit);
-        if (base > limit && (base - limit) <= 0xffffffffULL) {
-
-            *stackStart = limit;
-            *stackSize = static_cast<ULONG32>(base - limit);
-            return TRUE;
-        }
-    }
-
-    return FALSE;
-}
-
-
-// Counts process threads and finds the preferred exception-thread index used to place the exception context RVA.
-
-BOOL CountProcessThreads(DWORD preferredThreadId, ULONG32* threadCount, ULONG32* preferredIndex) noexcept
-{
-    INPROC_THREAD_SNAPSHOT snapshot = {};
-    ULONG32 count = 0;
-    ULONG32 foundIndex = 0;
-    BOOL foundPreferred = FALSE;
-
-    if (QueryCurrentProcessThreadSnapshot(&snapshot)) {
-        count = SnapshotThreadCount(snapshot);
-        for (ULONG32 i = 0; i < count; ++i) {
-            if (SnapshotThreadId(snapshot, i) == preferredThreadId) {
-                foundIndex = i;
-                foundPreferred = TRUE;
-                break;
-            }
-        }
-    }
-
-    if (count == 0) {
-        count = 1;
-    }
-    *threadCount = count;
-    *preferredIndex = foundPreferred ? foundIndex : 0;
-    return TRUE;
-}
 
 
 // Captures a thread's kernel-stored name (set via SetThreadDescription) into its immutable plan
@@ -266,7 +214,7 @@ static void CaptureThreadName(INPROC_THREAD_PLAN_ENTRY& entry) noexcept
 BOOL BuildThreadPlanAndFreeze(DWORD preferredThreadId) noexcept
 {
     g_ThreadPlanCount = 0;
-    g_ExceptionThreadIndex = 0;
+    ULONG32 exceptionThreadIndex = 0;
     DWORD currentTid = GetCurrentThreadId();
 
     INPROC_THREAD_SNAPSHOT snapshot = {};
@@ -289,10 +237,13 @@ BOOL BuildThreadPlanAndFreeze(DWORD preferredThreadId) noexcept
 
             const INPROC_SYSTEM_THREAD_INFORMATION* threadInfo = SnapshotThreadInfo(snapshot, i);
             if (threadInfo != nullptr) {
+                entry.ThreadState = static_cast<DWORD>(threadInfo->ThreadState);
+                entry.Priority = static_cast<DWORD>(threadInfo->Priority);
+                entry.StartAddress = reinterpret_cast<ULONG64>(threadInfo->StartAddress);
                 entry.CreateTime = static_cast<ULONG64>(threadInfo->CreateTime.QuadPart);
                 entry.KernelTime = static_cast<ULONG64>(threadInfo->KernelTime.QuadPart);
                 entry.UserTime = static_cast<ULONG64>(threadInfo->UserTime.QuadPart);
-                entry.StartAddress = reinterpret_cast<ULONG64>(threadInfo->StartAddress);
+                entry.WaitTime = static_cast<ULONG32>(threadInfo->WaitTime);
             }
 
             if (!entry.IsCurrent) {
@@ -332,8 +283,7 @@ BOOL BuildThreadPlanAndFreeze(DWORD preferredThreadId) noexcept
         g_ThreadPlan[slot].IsCurrent = TRUE;
     }
 
-    // Guarantee the exception (preferred) thread is always represented. ExceptionStream.ThreadContext
-    // aliases a slot inside the contiguous CONTEXT array via g_ExceptionThreadIndex; if the faulting
+    // Guarantee the exception (preferred) thread is always represented. If the faulting
     // thread were missing from the plan, that index would stay 0 and the exception context RVA would
     // silently point at some OTHER thread's context -- producing an openable but MISLEADING dump.
     // The snapshot can miss it (snapshot failure, or more threads than kMaxThreads), so if it is not
@@ -422,7 +372,7 @@ BOOL BuildThreadPlanAndFreeze(DWORD preferredThreadId) noexcept
         CaptureThreadName(entry);
 
         if (entry.ThreadId == preferredThreadId) {
-            g_ExceptionThreadIndex = i;
+            exceptionThreadIndex = i;
         }
     }
 
@@ -469,59 +419,6 @@ PVOID QueryThreadTeb(HANDLE hThread, DWORD threadId) noexcept
 }
 
 
-// Builds the stack memory descriptor for a thread from its TEB stack limits.
-
-void FillThreadStackDescriptor(PVOID teb, MINIDUMP_MEMORY_DESCRIPTOR* stack) noexcept
-{
-    INPROC_NT_TIB tib = {};
-    ZeroMemory(stack, sizeof(*stack));
-
-    if (teb == nullptr || !SafeCopyBytes(&tib, teb, sizeof(tib))) {
-        return;
-    }
-
-    ULONG64 stackBase = reinterpret_cast<ULONG64>(tib.StackBase);
-    ULONG64 stackLimit = reinterpret_cast<ULONG64>(tib.StackLimit);
-    if (stackBase > stackLimit) {
-        stack->StartOfMemoryRange = stackLimit;
-        stack->Memory.DataSize = static_cast<ULONG32>(stackBase - stackLimit);
-        stack->Memory.Rva = 0;
-    }
-}
-
-
-// Builds a MINIDUMP_THREAD record without allocating, using snapshot data where possible.
-
-void FillThreadDescriptor(DWORD threadId,
-                          ULONG32 index,
-                          ULONG32 contextBaseRva,
-                          PVOID knownTeb,
-                          MINIDUMP_THREAD* thread) noexcept
-{
-    HANDLE hThread = nullptr;
-    PVOID teb = knownTeb;
-
-    ZeroMemory(thread, sizeof(*thread));
-    thread->ThreadId = threadId;
-    thread->PriorityClass = GetPriorityClass(GetCurrentProcess());
-    thread->ThreadContext.Rva = contextBaseRva + index * sizeof(CONTEXT);
-    thread->ThreadContext.DataSize = sizeof(CONTEXT);
-
-    if (threadId == GetCurrentThreadId()) {
-        teb = GetCurrentTebPointer();
-        thread->Priority = GetThreadPriority(GetCurrentThread());
-    } else if (teb == nullptr) {
-        hThread = OpenThread(THREAD_QUERY_INFORMATION, FALSE, threadId);
-
-        if (hThread != nullptr) {
-            teb = QueryThreadTeb(hThread, threadId);
-            CloseHandle(hThread);
-        }
-    }
-
-    thread->Teb = reinterpret_cast<ULONG64>(teb);
-    FillThreadStackDescriptor(teb, &thread->Stack);
-}
 
 
 // Writes ThreadListStream from the immutable thread plan. Each thread's CONTEXT slot is at a
@@ -580,21 +477,21 @@ BOOL WriteThreadList(HANDLE hFile,
 // caller-provided exception context; other threads are already suspended, so GetThreadContext
 // is consistent with the stack bytes captured elsewhere in this dump.
 
-BOOL WriteThreadContexts(HANDLE hFile, ULONG32 threadCount, PMINIDUMP_EXCEPTION_INFORMATION exceptionParam) noexcept
+BOOL WriteThreadContexts(HANDLE hFile, ULONG32 threadCount, PMINIDUMP_EXCEPTION_INFORMATION /*exceptionParam*/) noexcept
 {
-    MINIDUMP_EXCEPTION_STREAM exceptionStream = {};
-    const CONTEXT* exceptionContext = nullptr;
-    BOOL hasExceptionContext = CaptureExceptionStreamInfo(exceptionParam, &exceptionStream, &exceptionContext);
+    //MINIDUMP_EXCEPTION_STREAM exceptionStream = {};
+    //const CONTEXT* exceptionContext = nullptr;
+    //BOOL hasExceptionContext = CaptureExceptionStreamInfo(exceptionParam, &exceptionStream, &exceptionContext);
 
     for (ULONG32 i = 0; i < threadCount && i < g_ThreadPlanCount; ++i) {
         const INPROC_THREAD_PLAN_ENTRY& entry = g_ThreadPlan[i];
 
-        if (hasExceptionContext && exceptionContext != nullptr && entry.ThreadId == exceptionStream.ThreadId) {
-            if (!WriteAll(hFile, exceptionContext, sizeof(CONTEXT))) {
-                return FALSE;
-            }
-            continue;
-        }
+        //if (hasExceptionContext && exceptionContext != nullptr && entry.ThreadId == exceptionStream.ThreadId) {
+        //    if (!WriteAll(hFile, exceptionContext, sizeof(CONTEXT))) {
+        //        return FALSE;
+        //    }
+        //    continue;
+        //}
 
         ZeroMemory(&g_ContextScratch, sizeof(g_ContextScratch));
         BOOL captured = FALSE;
@@ -740,47 +637,7 @@ BOOL WriteThreadNames(HANDLE hFile, ULONG32 threadCount, ULONG64 namesBaseRva) n
     return TRUE;
 }
 
-
-// Reads a thread stack range from its TEB, opening the thread only when it is not the current thread.
-
-BOOL QueryThreadStackRange(DWORD threadId, ULONG64* stackStart, ULONG32* stackSize) noexcept
-{
-    HANDLE hThread = nullptr;
-    PVOID teb = nullptr;
-    INPROC_NT_TIB tib = {};
-
-    *stackStart = 0;
-    *stackSize = 0;
-
-    if (threadId == GetCurrentThreadId()) {
-        teb = GetCurrentTebPointer();
-    } else {
-        hThread = OpenThread(THREAD_QUERY_INFORMATION, FALSE, threadId);
-        if (hThread != nullptr) {
-            teb = QueryThreadTeb(hThread, threadId);
-            CloseHandle(hThread);
-        }
-    }
-
-    if (teb == nullptr || !SafeCopyBytes(&tib, teb, sizeof(tib))) {
-        return FALSE;
-    }
-
-    ULONG64 base = reinterpret_cast<ULONG64>(tib.StackBase);
-    ULONG64 limit = reinterpret_cast<ULONG64>(tib.StackLimit);
-    if (base <= limit || (base - limit) > 0xffffffffULL) {
-        return FALSE;
-    }
-
-    *stackStart = limit;
-    *stackSize = static_cast<ULONG32>(base - limit);
-    return TRUE;
-}
-
-
 namespace {
-
-
 
 DWORD FindMainThreadId() noexcept
 {
@@ -800,25 +657,28 @@ DWORD FindMainThreadId() noexcept
 }
 
 ULONG64 CapturePlanStackPointer(const INPROC_THREAD_PLAN_ENTRY& entry,
-                                DWORD preferredThreadId,
-                                const CONTEXT* exceptionContext) noexcept
+                                DWORD /*preferredThreadId*/,
+                                const CONTEXT* /*exceptionContext*/) noexcept
 {
-    if (entry.ThreadId == preferredThreadId) {
-        ULONG64 sp = ContextStackPointer(exceptionContext);
-        if (sp != 0) {
-            return sp;
-        }
-    }
-
-    CONTEXT context = {};
+ //	  if (entry.ThreadId == preferredThreadId) {
+ //       ULONG64 sp = ContextStackPointer(exceptionContext);
+ //       if (sp != 0) {
+ //           return sp;
+ //       }
+ //   }
+    // Reuse the shared g_ContextScratch rather than a full CONTEXT on the stack: this runs on the
+    // crash path during plan capture, which is strictly serialized and never overlaps the other
+    // g_ContextScratch users (the indirect scan and WriteThreadContexts run in later phases).
+    CONTEXT* context = &g_ContextScratch;
+    *context = {};
     if (entry.IsCurrent) {
-        RtlCaptureContext(&context);
-        return ContextStackPointer(&context);
+        RtlCaptureContext(context);
+        return ContextStackPointer(context);
     }
     if (entry.Handle != nullptr && entry.Suspended) {
-        context.ContextFlags = CONTEXT_ALL;
-        if (GetThreadContext(entry.Handle, &context)) {
-            return ContextStackPointer(&context);
+        context->ContextFlags = CONTEXT_ALL;
+        if (GetThreadContext(entry.Handle, context)) {
+            return ContextStackPointer(context);
         }
     }
     return 0;
@@ -838,12 +698,6 @@ void ClipStackWindow(INPROC_THREAD_PLAN_ENTRY& entry, ULONG64 preferredSp, ULONG
     ULONG64 captureStart = 0;
     if (preferredSp >= stackStart && preferredSp < stackEnd) {
         captureStart = AlignDown(preferredSp, kIndirectMemoryRangeSize);
-        if (captureStart < stackStart) {
-            captureStart = stackStart;
-        }
-    } else if (stackSize > capBytes) {
-        captureStart = stackEnd - capBytes;
-        captureStart = AlignDown(captureStart, kIndirectMemoryRangeSize);
         if (captureStart < stackStart) {
             captureStart = stackStart;
         }
@@ -899,8 +753,6 @@ void AddStackOverflowHighWindow(INPROC_THREAD_PLAN_ENTRY& entry) noexcept
     entry.AuxStackSize = static_cast<ULONG32>(stackEnd - highStart);
 }
 
-
-
 BOOL TryIncludeStackRange(ULONG64* remaining, ULONG32* size, ULONG64* start, BOOL trimFromHighEnd) noexcept
 {
     if (*size == 0) {
@@ -942,7 +794,7 @@ void IncludePrimaryStack(ULONG32 index, ULONG64* remaining, BOOL allowTrim) noex
     BOOL included = allowTrim
         ? TryIncludeStackRange(remaining, &size, &start, FALSE)
         : (size != 0 && sizeof(MINIDUMP_MEMORY_DESCRIPTOR) + static_cast<ULONG64>(size) <= *remaining);
-    if (!allowTrim && included) {
+    if ((!allowTrim) && included) {
         *remaining -= sizeof(MINIDUMP_MEMORY_DESCRIPTOR) + static_cast<ULONG64>(size);
     }
     if (included) {
@@ -965,7 +817,7 @@ void IncludeAuxStack(ULONG32 index, ULONG64* remaining, BOOL allowTrim) noexcept
     BOOL included = allowTrim
         ? TryIncludeStackRange(remaining, &size, &start, TRUE)
         : (size != 0 && sizeof(MINIDUMP_MEMORY_DESCRIPTOR) + static_cast<ULONG64>(size) <= *remaining);
-    if (!allowTrim && included) {
+    if ((!allowTrim) && included) {
         *remaining -= sizeof(MINIDUMP_MEMORY_DESCRIPTOR) + static_cast<ULONG64>(size);
     }
     if (included) {
@@ -1078,7 +930,6 @@ BOOL CountStackMemoryRanges(ULONG32 threadCount, ULONG64* rangeCount, ULONG64* b
 
 // Extracts RSP/ESP from a CONTEXT for prioritizing indirect-memory scans near the crash frame.
 
-
 ULONG64 ContextStackPointer(const CONTEXT* context) noexcept
 {
     if (context == nullptr) {
@@ -1093,27 +944,5 @@ ULONG64 ContextStackPointer(const CONTEXT* context) noexcept
 #endif
 }
 
-
-
-
-
-// Returns the best stack range for a thread, preferring the live TEB for the current thread to avoid stale snapshot limits.
-
-
-BOOL QuerySnapshotOrThreadStackRange(const INPROC_THREAD_SNAPSHOT& snapshot,
-                                     ULONG32 index,
-                                     ULONG64* stackStart,
-                                     ULONG32* stackSize) noexcept
-{
-    DWORD threadId = SnapshotThreadId(snapshot, index);
-    if (threadId == GetCurrentThreadId() && QueryThreadStackRange(threadId, stackStart, stackSize)) {
-        return TRUE;
-    }
-    if (SnapshotThreadStackRange(snapshot, index, stackStart, stackSize)) {
-        return TRUE;
-    }
-    return QueryThreadStackRange(threadId, stackStart, stackSize);
-}
-
-
-} // namespace minidump_inproc::internal
+} // namespace internal
+} // namespace minidump_inproc

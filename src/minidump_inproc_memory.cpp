@@ -1,6 +1,7 @@
 #include "minidump_inproc_internal.h"
 
-namespace minidump_inproc::internal {
+namespace minidump_inproc {
+namespace internal {
 
 // Captures committed, dumpable regions for MiniDumpWithFullMemory into the shared scratch buffer
 // in a single VirtualQuery walk. Both the descriptor pass and the byte pass replay this fixed
@@ -314,9 +315,11 @@ static BOOL CollectIndirectPage(ULONG64 page, ULONG32 layer) noexcept
     }
 
     INPROC_MEMORY_RANGE* ranges = IndirectMemoryRanges();
-    ranges[g_IndirectMemoryRangeCount].Start = page;
-    ranges[g_IndirectMemoryRangeCount].Size = kIndirectMemoryRangeSize;
-    ranges[g_IndirectMemoryRangeCount].Layer = layer;
+    const ULONG32 idx = g_IndirectMemoryRangeCount;
+    ranges[idx].Start = page;
+    ranges[idx].Size = kIndirectMemoryRangeSize;
+    ranges[idx].Layer = layer;
+
     ++g_IndirectMemoryRangeCount;
     return g_IndirectMemoryRangeCount < g_IndirectMemoryRangeCap;
 }
@@ -334,7 +337,18 @@ BOOL AddIndirectMemoryRangeFromPointer(ULONG64 value, ULONG64 sourceStart, ULONG
     if (g_IndirectMemoryRangeCount >= g_IndirectMemoryRangeCap) {
         return FALSE;
     }
-    if (value < 0x10000ULL || (value >= sourceStart && value < sourceEnd)) {
+    if (value >= sourceStart && value < sourceEnd) {
+        return TRUE;
+    }
+    // Reject anything outside the live user-mode VA window. lp{Minimum,Maximum}ApplicationAddress come
+    // straight from GetNativeSystemInfo (cached pre-crash), so the bounds are exact for this system and
+    // architecture -- no hardcoded canonical split -- and naturally honor /3GB, large-address-aware and
+    // x86/ARM64 layouts. This rejects poison words (0xFFFF.../0xCCCC...), kernel and non-canonical pointers
+    // (keeping the dump clean) AND guarantees the straddle loop below can never start near the top of the
+    // address space and wrap. The lower bound also subsumes the old "value < 0x10000" null-page reject.
+    const ULONG64 minAppAddr = reinterpret_cast<ULONG64>(MinimumApplicationAddress());
+    const ULONG64 maxAppAddr = reinterpret_cast<ULONG64>(MaximumApplicationAddress());
+    if (value < minAppAddr || value > maxAppAddr) {
         return TRUE;
     }
 
@@ -345,7 +359,10 @@ BOOL AddIndirectMemoryRangeFromPointer(ULONG64 value, ULONG64 sourceStart, ULONG
     ULONG64 firstPage = AlignDown(value, kIndirectMemoryRangeSize);
     ULONG64 windowEnd = value + (kPointerStraddleWindow - 1);
     ULONG64 lastPage = (windowEnd < value) ? firstPage : AlignDown(windowEnd, kIndirectMemoryRangeSize);
-    for (ULONG64 page = firstPage; page <= lastPage; page += kIndirectMemoryRangeSize) {
+    // The "page >= firstPage" guard stops a runaway scan: if page ever wraps past the top of the address
+    // space (page += size rolls 0xFFFFFFFFFFFFF000 -> 0), the loop would otherwise restart from 0 and walk
+    // the entire address space. With it, the loop covers at most the straddle window's two pages.
+    for (ULONG64 page = firstPage; page >= firstPage && page <= lastPage; page += kIndirectMemoryRangeSize) {
         if (!CollectIndirectPage(page, layer)) {
             return FALSE;
         }
@@ -379,12 +396,15 @@ BOOL ScanStackSpanForIndirectMemory(ULONG64 scanStart, ULONG64 scanEnd,
 namespace {
 BOOL ScanPageForIndirectMemory(ULONG64 pageStart, ULONG32 layer) noexcept
 {
-    BYTE buffer[kIndirectMemoryRangeSize];
-    if (!SafeCopyBytes(buffer, reinterpret_cast<const void*>(static_cast<ULONG_PTR>(pageStart)), sizeof(buffer))) {
+    // Use the shared static scratch page instead of a 4KB stack buffer: this runs on the crash path
+    // (possibly already low on stack) and is invoked in a tight BFS loop, so keeping the page off the
+    // stack avoids deep frames. Safe because the dump is single-writer and this is not recursive.
+    BYTE* buffer = g_IndirectPageScratch;
+    if (!SafeCopyBytes(buffer, reinterpret_cast<const void*>(static_cast<ULONG_PTR>(pageStart)), kIndirectMemoryRangeSize)) {
         return TRUE;
     }
     for (ULONG32 offset = 0;
-         offset + sizeof(ULONG_PTR) <= sizeof(buffer) && g_IndirectMemoryRangeCount < g_IndirectMemoryRangeCap;
+         offset + sizeof(ULONG_PTR) <= kIndirectMemoryRangeSize && g_IndirectMemoryRangeCount < g_IndirectMemoryRangeCap;
          offset += sizeof(ULONG_PTR)) {
         ULONG_PTR value = 0;
         CopyMemory(&value, buffer + offset, sizeof(value));
@@ -491,9 +511,9 @@ static BOOL CaptureThreadContextForScan(const INPROC_THREAD_PLAN_ENTRY& entry, C
 }
 
 
-// Precomputes stack and data-segment MemoryList ranges so indirect pages can be checked against all known ranges.
+// Precomputes stack, data-segment and process/thread-data MemoryList ranges so indirect pages can be checked against all known ranges.
 
-void CollectKnownSelectedMemoryRanges(ULONG32 threadCount, BOOL includeDataSegs) noexcept
+void CollectKnownSelectedMemoryRanges(ULONG32 threadCount, BOOL includeDataSegs, BOOL includeProcThread) noexcept
 {
     ResetKnownMemoryRanges();
 
@@ -506,34 +526,89 @@ void CollectKnownSelectedMemoryRanges(ULONG32 threadCount, BOOL includeDataSegs)
         }
     }
 
-    if (!includeDataSegs) {
-        return;
+    // Replay the single process/thread-data capture (CaptureProcessThreadDataRanges) so indirect
+    // pages never re-capture the PEB/TEB/params/environment already planned for the MemoryList.
+    if (includeProcThread) {
+        for (ULONG32 i = 0; i < g_ProcThreadRangeCount && g_KnownMemoryRangeCount < kMaxKnownMemoryRanges; ++i) {
+            AddKnownMemoryRange(g_ProcThreadRanges[i].Start, g_ProcThreadRanges[i].Size);
+        }
     }
 
-    MEMORY_BASIC_INFORMATION mbi = {};
-    BYTE* address = MinimumApplicationAddress();
-    BYTE* maximum = MaximumApplicationAddress();
-    while (address < maximum && g_KnownMemoryRangeCount < kMaxKnownMemoryRanges) {
-        SIZE_T queried = VirtualQuery(address, &mbi, sizeof(mbi));
-        if (queried == 0 || mbi.RegionSize == 0) {
-            break;
+    if (includeDataSegs) {
+        // Replay the single data-seg capture (CaptureDataSegRanges) instead of re-walking VirtualQuery,
+        // so the known ranges match exactly what the descriptor/byte passes will emit.
+        for (ULONG32 i = 0; i < g_DataSegRangeCount && g_KnownMemoryRangeCount < kMaxKnownMemoryRanges; ++i) {
+            AddKnownMemoryRange(g_DataSegRanges[i].Start, g_DataSegRanges[i].Size);
         }
-        if (ShouldIncludeExtraMemoryRange(mbi, includeDataSegs)) {
-            AddKnownMemoryRange(reinterpret_cast<ULONG64>(mbi.BaseAddress), static_cast<ULONG64>(mbi.RegionSize));
+    }
+}
+
+
+// Walks a pointer chain DEPTH-FIRST from an already-collected seed page down to kIndirectMaxScanLayers,
+// following at most kIndirectChainFanout outgoing pointers per page. This runs BEFORE the breadth pass
+// for the faulting thread's seeds: when the file-size budget is tight, a single dense seed page (e.g.
+// one full of heap pointers) can exhaust the whole cap on its layer-2 fan-out, leaving no room for the
+// breadth pass to ever expand the OTHER seeds -- so a deep but narrow object chain rooted on the crash
+// stack (root -> child -> grand) gets truncated at layer 1. Reserving a small, bounded slice to follow
+// each seed's chain depth-first first guarantees such chains survive to full depth; the fan-out cap
+// keeps the reservation bounded (<= sum_{d<layers} fanout^d pages per seed) so breadth still gets the
+// rest. Dedup/known-overlap/cap gates are all enforced via AddIndirectMemoryRangeFromPointer, so pages
+// captured here are never double-counted by the subsequent breadth expansion.
+//
+// seedStopCount is a HARD count-based budget ceiling for the layer-1 seed that started this walk: the
+// walk (and all its recursion) stops as soon as g_IndirectMemoryRangeCount reaches it. The fan-out cap
+// bounds a well-behaved chain, but a pathological dense seed could otherwise chain into enough live
+// pages to swallow most of the cap before the other seeds (including the narrow root->child->grand
+// chain) are reached. Checking the count directly bounds each seed's reservation no matter what the
+// fan-out/recursion shape ends up being, so every layer-1 seed is guaranteed its turn.
+
+static void FollowIndirectChainDepthFirst(ULONG64 pageStart, ULONG32 layer, ULONG32 seedStopCount) noexcept
+{
+    if (layer >= kIndirectMaxScanLayers
+        || g_IndirectMemoryRangeCount >= g_IndirectMemoryRangeCap
+        || g_IndirectMemoryRangeCount >= seedStopCount) {
+        return;
+    }
+    // layer is in [1, kIndirectMaxScanLayers - 1] here, so (layer - 1) indexes a distinct per-depth
+    // buffer and the recursion never clobbers a parent frame's page copy.
+    BYTE* buffer = g_IndirectChainScratch[layer - 1];
+    if (!SafeCopyBytes(buffer, reinterpret_cast<const void*>(static_cast<ULONG_PTR>(pageStart)),
+                       kIndirectMemoryRangeSize)) {
+        return;
+    }
+    ULONG32 followed = 0;
+    for (ULONG32 offset = 0;
+         offset + sizeof(ULONG_PTR) <= kIndirectMemoryRangeSize
+             && followed < kIndirectChainFanout
+             && g_IndirectMemoryRangeCount < g_IndirectMemoryRangeCap
+             && g_IndirectMemoryRangeCount < seedStopCount;
+         offset += sizeof(ULONG_PTR)) {
+        ULONG_PTR value = 0;
+        CopyMemory(&value, buffer + offset, sizeof(value));
+        ULONG64 target = static_cast<ULONG64>(value);
+        if (target < reinterpret_cast<ULONG64>(MinimumApplicationAddress())
+            || target > reinterpret_cast<ULONG64>(MaximumApplicationAddress())
+            || (target >= pageStart && target < pageStart + kIndirectMemoryRangeSize)) {
+            continue;
         }
-        BYTE* next = static_cast<BYTE*>(mbi.BaseAddress) + mbi.RegionSize;
-        if (next <= address) {
-            break;
+        
+        ULONG32 before = g_IndirectMemoryRangeCount;
+        (void)AddIndirectMemoryRangeFromPointer(target, pageStart, pageStart + kIndirectMemoryRangeSize, layer + 1);
+        if (g_IndirectMemoryRangeCount > before) {
+            // A new page was just captured for this pointer: descend into it so the chain is followed
+            // to full depth before we move on to this page's next sibling pointer.
+            ++followed;
+            FollowIndirectChainDepthFirst(AlignDown(target, kIndirectMemoryRangeSize), layer + 1, seedStopCount);
         }
-        address = next;
     }
 }
 
 
 // Collects indirect 4KB pages via multi-layer BFS, bounded by g_IndirectMemoryRangeCap (file-size
 // budget) and kIndirectMaxScanLayers (depth). Priority order, filled until the cap is hit:
-//   1. the faulting thread's entire reference subtree (layer 1 -> 2 -> 3),
-//   2. then every other thread's subtree (also layer 1 -> 2 -> 3).
+//   1. the faulting thread's chains followed depth-first (so deep narrow object graphs survive),
+//   2. the faulting thread's remaining reference subtree breadth-first (layer 1 -> 2 -> 3),
+//   3. then every other thread's subtree (also layer 1 -> 2 -> 3).
 // This keeps the data most relevant to the crash even when the budget is tight.
 
 BOOL CollectIndirectMemoryRanges(ULONG32 threadCount,
@@ -565,18 +640,34 @@ BOOL CollectIndirectMemoryRanges(ULONG32 threadCount,
         }
         break;
     }
+
+    // Depth-first reservation: follow each layer-1 seed's pointer chain to full depth BEFORE the breadth
+    // pass, so a deep narrow object graph rooted on the crash stack survives even when one dense seed's
+    // breadth fan-out would otherwise consume the entire budget (see FollowIndirectChainDepthFirst).
+    // Each seed is given a hard kIndirectPerSeedReserve-page slice (relative to the current count) so no
+    // single seed can monopolize the cap and starve the later seeds' chains.
+    {
+        const ULONG32 seedCount = g_IndirectMemoryRangeCount; // appended pages stay >= seedCount; never re-walked
+        const INPROC_MEMORY_RANGE* seeds = IndirectMemoryRanges();
+        for (ULONG32 i = 0; i < seedCount && g_IndirectMemoryRangeCount < g_IndirectMemoryRangeCap; ++i) {
+            const ULONG32 seedStop = g_IndirectMemoryRangeCount + kIndirectPerSeedReserve;
+            FollowIndirectChainDepthFirst(seeds[i].Start, seeds[i].Layer, seedStop);
+        }
+    }
+
     bfsHead = ExpandIndirectBfs(bfsHead);
 
     // Phase 2: remaining threads' registers and stacks (layer 1), then expand their subtrees. Each
     // thread is frozen for the whole dump, so its live register context is consistent with the stack
-    // bytes captured elsewhere.
-    CONTEXT threadContext;
+    // bytes captured elsewhere. Reuse the shared g_ContextScratch (this layout phase never overlaps
+    // WriteThreadContexts, the only other user) to keep a full CONTEXT off the crash-path stack.
+    CONTEXT* threadContext = &g_ContextScratch;
     for (ULONG32 i = 0; i < g_ThreadPlanCount && g_IndirectMemoryRangeCount < g_IndirectMemoryRangeCap; ++i) {
         if (g_ThreadPlan[i].ThreadId == preferredThreadId) {
             continue;
         }
-        if (CaptureThreadContextForScan(g_ThreadPlan[i], &threadContext)) {
-            (void)ScanContextRegistersForIndirectMemory(&threadContext, 1);
+        if (CaptureThreadContextForScan(g_ThreadPlan[i], threadContext)) {
+            (void)ScanContextRegistersForIndirectMemory(threadContext, 1);
         }
         if (!g_ThreadPlan[i].IncludeStack || g_ThreadPlan[i].StackSize == 0) {
             continue;
@@ -594,42 +685,202 @@ BOOL CollectIndirectMemoryRanges(ULONG32 threadCount,
 }
 
 
-// Counts optional selected memory ranges such as writable image data segments.
+// Validates one process/thread-data candidate (start + requested size), clamps it to the committed,
+// dumpable VirtualQuery region that contains it, caps it, de-duplicates it against the ranges already
+// captured, and records it in g_ProcThreadRanges. Clamping to the region means an over-estimated
+// requested size can never read past the real allocation, and the dedup keeps the descriptor/byte
+// passes free of overlapping entries. Silently no-ops on any failure (best-effort, crash-path safe).
 
-BOOL CountExtraMemoryRanges(BOOL includeDataSegs,
-                            ULONG64* rangeCount,
-                            ULONG64* bytesCount) noexcept
+static void AddProcThreadRange(ULONG64 start, ULONG64 requestedSize) noexcept
 {
-    BYTE* address = nullptr;
-    BYTE* maximum = nullptr;
-    MEMORY_BASIC_INFORMATION mbi = {};
-    ULONG64 count = 0;
-    ULONG64 bytes = 0;
-
-    address = MinimumApplicationAddress();
-    maximum = MaximumApplicationAddress();
-
-    while (address < maximum) {
-        SIZE_T queried = VirtualQuery(address, &mbi, sizeof(mbi));
-        if (queried == 0 || mbi.RegionSize == 0) {
-            break;
-        }
-
-        if (ShouldIncludeExtraMemoryRange(mbi, includeDataSegs)) {
-            ++count;
-            bytes += static_cast<ULONG64>(mbi.RegionSize);
-        }
-
-
-        BYTE* next = static_cast<BYTE*>(mbi.BaseAddress) + mbi.RegionSize;
-        if (next <= address) {
-            break;
-        }
-        address = next;
+    if (start == 0 || requestedSize == 0 || g_ProcThreadRangeCount >= kMaxProcThreadRanges) {
+        return;
+    }
+    if (requestedSize > kProcThreadRangeMaxBytes) {
+        requestedSize = kProcThreadRangeMaxBytes;
     }
 
-    *rangeCount = count;
-    *bytesCount = bytes;
+    MEMORY_BASIC_INFORMATION mbi = {};
+    if (VirtualQuery(reinterpret_cast<LPCVOID>(static_cast<ULONG_PTR>(start)), &mbi, sizeof(mbi)) == 0) {
+        return;
+    }
+    if (mbi.State != MEM_COMMIT || !IsDumpableProtect(mbi.Protect)) {
+        return;
+    }
+    const ULONG64 regionStart = reinterpret_cast<ULONG64>(mbi.BaseAddress);
+    const ULONG64 regionEnd = regionStart + static_cast<ULONG64>(mbi.RegionSize);
+    if (start < regionStart || start >= regionEnd) {
+        return;
+    }
+    const ULONG64 avail = regionEnd - start;
+    if (requestedSize > avail) {
+        requestedSize = avail;
+    }
+
+    // Skip anything that overlaps a range already captured (e.g. a UNICODE_STRING buffer that lives
+    // inside the process-parameters block, which was added first). This keeps MemoryList descriptors
+    // non-overlapping, matching how AddKnownMemoryRange coalesces the stack/data-seg plan.
+    for (ULONG32 i = 0; i < g_ProcThreadRangeCount; ++i) {
+        if (RangesOverlap(start, requestedSize, g_ProcThreadRanges[i].Start, g_ProcThreadRanges[i].Size)) {
+            return;
+        }
+    }
+
+    g_ProcThreadRanges[g_ProcThreadRangeCount].Start = start;
+    g_ProcThreadRanges[g_ProcThreadRangeCount].Size = requestedSize;
+    g_ProcThreadBytes += requestedSize;
+    ++g_ProcThreadRangeCount;
+}
+
+
+// Adds the buffer backing one UNICODE_STRING (from a local copy of the process parameters) as a
+// process/thread-data range. MaximumLength is preferred over Length so the full allocation is kept;
+// AddProcThreadRange validates and clamps the buffer pointer, so a stale/garbage descriptor is safe.
+
+static void AddProcThreadUnicodeString(const INPROC_UNICODE_STRING* us) noexcept
+{
+    if (us == nullptr || us->Buffer == nullptr) {
+        return;
+    }
+    ULONG64 size = us->MaximumLength != 0 ? us->MaximumLength : us->Length;
+    if (size == 0) {
+        return;
+    }
+    AddProcThreadRange(reinterpret_cast<ULONG64>(us->Buffer), size);
+}
+
+
+// Captures the MiniDumpWithProcessThreadData memory set once into g_ProcThreadRanges. Mirrors the
+// semantics of dbghelp's MiniDumpWithProcessThreadData: the PEB, every frozen thread's TEB, the
+// RTL_USER_PROCESS_PARAMETERS block, the environment block, and the UNICODE_STRING buffers the
+// parameters reference. Every read goes through SafeCopyBytes/VirtualQuery and every range is region
+// clamped + capped + de-duplicated, so the whole capture is best-effort and crash-path safe.
+//
+// Intentional differences from dbghelp (documented, acceptable per the library's design): the full
+// environment block is captured (EnvironmentSize) rather than a fixed 0x2000 window, and the internal
+// per-thread runtime blocks dbghelp reaches through TEB pointers (e.g. the FLS context) are not
+// chased -- the documented PEB/TEB/parameters/environment set is what makes !peb/!teb, the command
+// line, the current directory and the environment resolve in WinDbg.
+
+BOOL CaptureProcessThreadDataRanges(BOOL includeProcThread,
+                                    ULONG32 threadCount,
+                                    ULONG64* rangeCount,
+                                    ULONG64* bytesCount) noexcept
+{
+    g_ProcThreadRangeCount = 0;
+    g_ProcThreadBytes = 0;
+
+    if (includeProcThread) {
+        INPROC_PEB* peb = GetCurrentPeb();
+
+        // PEB first so anything that happens to alias it is de-duplicated against it.
+        if (peb != nullptr) {
+            AddProcThreadRange(reinterpret_cast<ULONG64>(peb), kProcThreadPebBytes);
+        }
+
+        // Every frozen thread's TEB (the "thread data"). The plan already froze these pointers.
+        for (ULONG32 i = 0; i < threadCount && i < g_ThreadPlanCount; ++i) {
+            if (g_ThreadPlan[i].Teb != nullptr) {
+                AddProcThreadRange(reinterpret_cast<ULONG64>(g_ThreadPlan[i].Teb), kProcThreadTebBytes);
+            }
+        }
+
+        // RTL_USER_PROCESS_PARAMETERS + environment + the strings it references (the "process data").
+        if (peb != nullptr) {
+            void* paramsPtr = nullptr;
+            if (SafeCopyBytes(&paramsPtr, &peb->ProcessParameters, sizeof(paramsPtr)) && paramsPtr != nullptr) {
+                // Copy only the leading core (up to CurrentDirectores) so older OSes that lack the
+                // trailing fields are tolerated; EnvironmentSize is probed separately below.
+                INPROC_RTL_USER_PROCESS_PARAMETERS params = {};
+                const SIZE_T coreSize = offsetof(INPROC_RTL_USER_PROCESS_PARAMETERS, CurrentDirectores);
+                if (SafeCopyBytes(&params, paramsPtr, coreSize)) {
+                    // The parameters block itself. MaximumLength is the allocated size of the block
+                    // (it usually carries the inline image-path/command-line strings), so capturing it
+                    // also absorbs those buffers; the per-string adds below then cover any that live
+                    // outside the block (e.g. the current directory).
+                    ULONG64 paramsSize = params.MaximumLength;
+                    if (paramsSize < kProcThreadParamsMinBytes) {
+                        paramsSize = kProcThreadParamsMinBytes;
+                    }
+                    AddProcThreadRange(reinterpret_cast<ULONG64>(paramsPtr), paramsSize);
+
+                    // Environment block. EnvironmentSize sits past the core copy, so probe it with its
+                    // own guarded read and fall back to a default window when it is unavailable/zero.
+                    if (params.Environment != nullptr) {
+                        SIZE_T envSizeField = 0;
+                        ULONG64 envSize = kProcThreadEnvDefaultBytes;
+                        const BYTE* envSizeAddr = reinterpret_cast<const BYTE*>(paramsPtr) +
+                            offsetof(INPROC_RTL_USER_PROCESS_PARAMETERS, EnvironmentSize);
+                        if (SafeCopyBytes(&envSizeField, envSizeAddr, sizeof(envSizeField))
+                            && envSizeField != 0 && envSizeField <= kProcThreadEnvMaxBytes) {
+                            envSize = static_cast<ULONG64>(envSizeField);
+                        }
+                        AddProcThreadRange(reinterpret_cast<ULONG64>(params.Environment), envSize);
+                    }
+
+                    // Referenced UNICODE_STRING buffers. Those that fall inside the parameters block
+                    // are de-duplicated away; the rest (typically the current directory) get their own
+                    // range, matching dbghelp.
+                    AddProcThreadUnicodeString(&params.CurrentDirectory.DosPath);
+                    AddProcThreadUnicodeString(&params.DllPath);
+                    AddProcThreadUnicodeString(&params.ImagePathName);
+                    AddProcThreadUnicodeString(&params.CommandLine);
+                    AddProcThreadUnicodeString(&params.WindowTitle);
+                    AddProcThreadUnicodeString(&params.DesktopInfo);
+                    AddProcThreadUnicodeString(&params.ShellInfo);
+                    AddProcThreadUnicodeString(&params.RuntimeData);
+                }
+            }
+        }
+    }
+
+    *rangeCount = g_ProcThreadRangeCount;
+    *bytesCount = g_ProcThreadBytes;
+    return TRUE;
+}
+
+
+// Captures optional selected memory ranges (writable image data segments) once into the fixed
+// g_DataSegRanges list in a single VirtualQuery walk. The known-range, descriptor and byte passes all
+// replay this list, so they can never disagree on count or size even if the live address space shifts
+// (it was previously re-walked in each of those passes). Regions beyond kMaxDataSegRanges are dropped,
+// degrading gracefully while staying internally consistent.
+
+BOOL CaptureDataSegRanges(BOOL includeDataSegs,
+                          ULONG64* rangeCount,
+                          ULONG64* bytesCount) noexcept
+{
+    g_DataSegRangeCount = 0;
+    g_DataSegBytes = 0;
+
+    if (includeDataSegs) {
+        MEMORY_BASIC_INFORMATION mbi = {};
+        BYTE* address = MinimumApplicationAddress();
+        BYTE* maximum = MaximumApplicationAddress();
+
+        while (address < maximum && g_DataSegRangeCount < kMaxDataSegRanges) {
+            SIZE_T queried = VirtualQuery(address, &mbi, sizeof(mbi));
+            if (queried == 0 || mbi.RegionSize == 0) {
+                break;
+            }
+
+            if (ShouldIncludeExtraMemoryRange(mbi, includeDataSegs)) {
+                g_DataSegRanges[g_DataSegRangeCount].Start = reinterpret_cast<ULONG64>(mbi.BaseAddress);
+                g_DataSegRanges[g_DataSegRangeCount].Size = static_cast<ULONG64>(mbi.RegionSize);
+                g_DataSegBytes += static_cast<ULONG64>(mbi.RegionSize);
+                ++g_DataSegRangeCount;
+            }
+
+            BYTE* next = static_cast<BYTE*>(mbi.BaseAddress) + mbi.RegionSize;
+            if (next <= address) {
+                break;
+            }
+            address = next;
+        }
+    }
+
+    *rangeCount = g_DataSegRangeCount;
+    *bytesCount = g_DataSegBytes;
     return TRUE;
 }
 
@@ -685,12 +936,13 @@ BOOL WriteSelectedMemoryDescriptors(HANDLE hFile,
                                     ULONG32 threadCount,
                                     BOOL includeDataSegs,
                                     ULONG64 stackRangeCount,
+                                    ULONG64 procThreadRangeCount,
                                     ULONG64 extraRangeCount,
                                     ULONG64 indirectRangeCount,
                                     ULONG64 memoryBaseRva) noexcept
 {
     MINIDUMP_MEMORY_DESCRIPTOR descriptor = {};
-    ULONG64 totalCount = stackRangeCount + extraRangeCount + indirectRangeCount;
+    ULONG64 totalCount = stackRangeCount + procThreadRangeCount + extraRangeCount + indirectRangeCount;
 
     ULONG64 currentRva = memoryBaseRva;
 
@@ -727,31 +979,31 @@ BOOL WriteSelectedMemoryDescriptors(HANDLE hFile,
         }
     }
 
-    BYTE* address = nullptr;
-    BYTE* maximum = nullptr;
-    MEMORY_BASIC_INFORMATION mbi = {};
-    address = MinimumApplicationAddress();
-    maximum = MaximumApplicationAddress();
-    while (address < maximum) {
-        SIZE_T queried = VirtualQuery(address, &mbi, sizeof(mbi));
-        if (queried == 0 || mbi.RegionSize == 0) {
-            break;
+    // Process/thread data (PEB, TEBs, parameters, environment, referenced strings) replays the single
+    // CaptureProcessThreadDataRanges plan, so these descriptors stay byte-for-byte consistent with
+    // WriteSelectedMemoryBytes. procThreadRangeCount is 0 when the set was dropped by budget.
+    for (ULONG32 i = 0; i < g_ProcThreadRangeCount && i < procThreadRangeCount; ++i) {
+        descriptor.StartOfMemoryRange = g_ProcThreadRanges[i].Start;
+        descriptor.Memory.Rva = static_cast<RVA>(currentRva);
+        descriptor.Memory.DataSize = static_cast<ULONG32>(g_ProcThreadRanges[i].Size);
+        if (!WriteAll(hFile, &descriptor, sizeof(descriptor))) {
+            return FALSE;
         }
-        if (ShouldIncludeExtraMemoryRange(mbi, includeDataSegs)) {
-            descriptor.StartOfMemoryRange = reinterpret_cast<ULONG64>(mbi.BaseAddress);
-            descriptor.Memory.Rva = static_cast<RVA>(currentRva);
-            descriptor.Memory.DataSize = static_cast<ULONG32>(mbi.RegionSize);
-            if (!WriteAll(hFile, &descriptor, sizeof(descriptor))) {
-                return FALSE;
-            }
-            currentRva += descriptor.Memory.DataSize;
-        }
+        currentRva += descriptor.Memory.DataSize;
+    }
 
-        BYTE* next = static_cast<BYTE*>(mbi.BaseAddress) + mbi.RegionSize;
-        if (next <= address) {
-            break;
+    // Data segments replay the single CaptureDataSegRanges plan (not a live VirtualQuery re-walk), so
+    // these descriptors are byte-for-byte consistent with WriteSelectedMemoryBytes. includeDataSegs is
+    // implied by extraRangeCount (0 when data segs were dropped); g_DataSegRangeCount bounds the list.
+    (void)includeDataSegs;
+    for (ULONG32 i = 0; i < g_DataSegRangeCount && i < extraRangeCount; ++i) {
+        descriptor.StartOfMemoryRange = g_DataSegRanges[i].Start;
+        descriptor.Memory.Rva = static_cast<RVA>(currentRva);
+        descriptor.Memory.DataSize = static_cast<ULONG32>(g_DataSegRanges[i].Size);
+        if (!WriteAll(hFile, &descriptor, sizeof(descriptor))) {
+            return FALSE;
         }
-        address = next;
+        currentRva += descriptor.Memory.DataSize;
     }
 
     const INPROC_MEMORY_RANGE* indirectRanges = IndirectMemoryRanges();
@@ -774,6 +1026,7 @@ BOOL WriteSelectedMemoryDescriptors(HANDLE hFile,
 BOOL WriteSelectedMemoryBytes(HANDLE hFile,
                               ULONG32 threadCount,
                               BOOL includeDataSegs,
+                              ULONG64 procThreadRangeCount,
                               ULONG64 indirectRangeCount) noexcept
 {
     // Emit stack bytes in the same plan order as WriteSelectedMemoryDescriptors. Each stack is
@@ -798,27 +1051,30 @@ BOOL WriteSelectedMemoryBytes(HANDLE hFile,
         }
     }
 
-    BYTE* address = nullptr;
-    BYTE* maximum = nullptr;
-    MEMORY_BASIC_INFORMATION mbi = {};
-    address = MinimumApplicationAddress();
-    maximum = MaximumApplicationAddress();
-    while (address < maximum) {
-        SIZE_T queried = VirtualQuery(address, &mbi, sizeof(mbi));
-        if (queried == 0 || mbi.RegionSize == 0) {
-            break;
+    // Process/thread-data bytes replay the same CaptureProcessThreadDataRanges plan as the descriptor
+    // pass (same order), so descriptor.DataSize always matches the bytes on disk. procThreadRangeCount
+    // is 0 (set dropped by budget) writes nothing here, mirroring the zero descriptors emitted there.
+    for (ULONG32 i = 0; i < g_ProcThreadRangeCount && i < procThreadRangeCount; ++i) {
+        if (!WriteRegionBytes(
+                hFile,
+                reinterpret_cast<BYTE*>(static_cast<ULONG_PTR>(g_ProcThreadRanges[i].Start)),
+                static_cast<SIZE_T>(g_ProcThreadRanges[i].Size))) {
+            return FALSE;
         }
-        if (ShouldIncludeExtraMemoryRange(mbi, includeDataSegs)) {
-            if (!WriteRegionBytes(hFile, static_cast<BYTE*>(mbi.BaseAddress), mbi.RegionSize)) {
+    }
+
+    // Data-seg bytes replay the same CaptureDataSegRanges plan as the descriptor pass (in the same
+    // order), so descriptor.DataSize always matches the bytes on disk. includeDataSegs being FALSE
+    // (data segs dropped by budget) writes nothing here, mirroring the zero descriptors emitted there.
+    if (includeDataSegs) {
+        for (ULONG32 i = 0; i < g_DataSegRangeCount; ++i) {
+            if (!WriteRegionBytes(
+                    hFile,
+                    reinterpret_cast<BYTE*>(static_cast<ULONG_PTR>(g_DataSegRanges[i].Start)),
+                    static_cast<SIZE_T>(g_DataSegRanges[i].Size))) {
                 return FALSE;
             }
         }
-
-        BYTE* next = static_cast<BYTE*>(mbi.BaseAddress) + mbi.RegionSize;
-        if (next <= address) {
-            break;
-        }
-        address = next;
     }
 
     const INPROC_MEMORY_RANGE* indirectRanges = IndirectMemoryRanges();
@@ -879,5 +1135,5 @@ BOOL WriteMemoryBytes(HANDLE hFile, ULONG64 rangeCount) noexcept
     return TRUE;
 }
 
-
-} // namespace minidump_inproc::internal
+} // namespace internal
+} // namespace minidump_inproc

@@ -307,6 +307,11 @@ int RunChild(const wchar_t* scenario, const wchar_t* dumpPath, ULONG64 maxFileSi
             MiniDumpIgnoreInaccessibleMemory);
     }
 
+    // Provenance (the per-page register/stack/page reference chain that the indirect scan walked) is
+    // reconstructed AFTER the fact by MiniDumpInspect, which re-runs the reference BFS over the memory
+    // captured in the dump and writes <dump>.prov.csv. The library itself no longer tracks it, keeping
+    // the crash path lean. See examples/minidump_inspect.cpp and examples/prov_csv_to_tree.py.
+
     g_DumpRequest = CreateEventW(nullptr, FALSE, FALSE, nullptr);
     g_DumpDone = CreateEventW(nullptr, FALSE, FALSE, nullptr);
     g_WorkersReady = CreateEventW(nullptr, TRUE, FALSE, nullptr);
